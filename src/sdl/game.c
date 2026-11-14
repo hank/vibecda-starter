@@ -45,10 +45,10 @@ static const Rank ranks[] = {
   { "SCOUT",   "HOME ROW AND TOP ROW",   16,  8, 3.2f, 3,  0, 0 },
   { "SQUIRE",  "EVERY LETTER",           20, 10, 2.6f, 3,  0, 1 },
   { "ARCHER",  "SHORT WORDS",            16,  9, 3.2f, 3,  0, 1 },
-  { "KNIGHT",  "LONGER WORDS",           18, 10, 3.0f, 4,  0, 2 },
-  { "CAPTAIN", "KEEP 15 WORDS A MINUTE", 20, 11, 2.6f, 4, 15, 2 },
-  { "WARDEN",  "KEEP 25 WORDS A MINUTE", 24, 12, 2.2f, 5, 25, 3 },
-  { "LEGEND",  "KEEP 40 WORDS A MINUTE", 30, 13, 1.8f, 6, 40, 3 },
+  { "KNIGHT",  "LONGER WORDS, TOUGH BRUTES",  18, 10, 3.0f, 4,  0, 2 },
+  { "CAPTAIN", "TWO-WORD FOES. KEEP 15 WPM",  20, 11, 2.6f, 4, 15, 2 },
+  { "WARDEN",  "PHRASES. KEEP 25 WPM",        24, 11, 2.2f, 5, 25, 3 },
+  { "LEGEND",  "LONG PHRASES. KEEP 40 WPM",   30, 11, 1.8f, 5, 40, 3 },
 };
 #define NRANKS ((int)SDL_arraysize(ranks))
 
@@ -68,6 +68,18 @@ static const char *const words10[] = { "APPARITION","BANSHEE","BARRICADE","CAULD
   "KNIGHTHOOD","LANTERNS","MAUSOLEUM","MIDNIGHT","MOONLIGHT","NECROMANCER","NIGHTMARE","OUTBREAK","PALISADE",
   "PHANTOM","QUARANTINE","RAMPARTS","SCARECROW","SKELETON","SURVIVOR","TOMBSTONE","TWILIGHT","UNDERTAKER",
   "VENGEANCE","WEREWOLF","WITCHCRAFT","YEARNING","ZOMBIFIED" };
+// Tougher monsters carry a phrase: one hitpoint per word, with a space between.
+static const char *const phrases2[] = { "BLACK CAT","BONE DUST","COLD NIGHT","CREAKY DOOR","DARK WOODS","DEAD LEAVES",
+  "EVIL GRIN","FOGGY PATH","FULL MOON","GRIM REAPER","HOLD FAST","IRON GATE","JAGGED ROCK","KEEP WATCH","LAST LIGHT",
+  "LOST SOUL","MOSSY CRYPT","NIGHT WATCH","OPEN GRAVE","PALE GHOST","QUIET TOMB","RED EYES","STONE WALL","TALL PINES",
+  "UNDEAD ARMY","VILE CURSE","WILD HOWL","YELLOW FANGS","ZOMBIE HORDE" };
+static const char *const phrases3[] = { "AIM FOR THE HEAD","BAR THE GATE","CLOSE THE SHUTTERS","DO NOT LOOK BACK",
+  "EYES ON THE WOODS","FEAR THE FULL MOON","GUARD THE YARD","HOLD THE WALL","JUMP THE FENCE","KEEP THE FIRE LIT",
+  "LIGHT THE TORCH","MIND THE GRAVES","NIGHT IS NOT OVER","ONE MORE WAVE","PRAY FOR THE DAWN","QUIET AS A GRAVE",
+  "RUN TO THE TOWER","SAVE THE VILLAGE","THE DEAD RISE","UNDER A BLOOD MOON","VOICES IN THE DARK","WATCH THE TREE LINE",
+  "WOLVES IN THE MIST","STAY ON HOME ROW","THEY NEVER SLEEP","ZOMBIES AT THE GATE" };
+// Each word of a phrase, and the armour pip it breaks, gets its own colour.
+static const Uint32 word_colors[4] = { C_SKIN, C_CYAN, C_PINK, C_ZOMBIE };
 typedef struct { const char *const *w; int n; } Pool;
 #define POOL(a) ((Pool){ a, (int)SDL_arraysize(a) })
 
@@ -83,10 +95,11 @@ enum { K_ZOMBIE, K_BAT, K_BRUTE };
 typedef struct {
   bool alive, doomed;
   int kind, lane, variant, len, typed;
-  float x, rise, anim, atk, dying;
-  char word[16];
+  int hp, words;       // words still to type, and words in total
+  float x, rise, anim, atk, dying, hurt;
+  char word[28];
 } Enemy;
-typedef struct { bool on; float x, y; int target; bool at_boss; } Bolt;
+typedef struct { bool on; float x, y; int target; bool at_boss, wound; } Bolt;
 typedef struct { float x, y, vx, vy, life; Uint32 color; } Particle;
 typedef struct { int step, col, state; } Note;   // state: 0 pending, 1 hit, 2 missed
 
@@ -115,16 +128,22 @@ static SDL_Window *win;
 static SDL_Texture *screen_tex, *bg_tex;
 static Spr s_zombie[3][2], s_bat[2], s_brute, s_lich, s_archer, s_bolt[4], s_tomb, s_heart, s_note;
 
-// The archer's weapon improves every two ranks. Better weapons fly faster and
-// their impact knocks back other monsters near the one that was hit.
-typedef struct { const char *name; float speed; int splash, push; Uint32 trail; } Weapon;
+// The archer's weapon is earned by typing without a mistake: each streak length
+// below unlocks the next one, and a wrong key drops back to oak arrows. Better
+// weapons fly faster and their impact knocks back monsters near the one hit.
+typedef struct { const char *name; int streak; float speed; int splash, push; Uint32 trail; } Weapon;
 static const Weapon weapons[] = {
-  { "OAK ARROWS",    520,  0,  0, 0 },
-  { "FIRE ARROWS",   560, 36, 10, C_SKIN },
-  { "SILVER BOLTS",  800, 44, 14, C_WHITE },
-  { "STORM STAFF",  1400, 60, 18, C_CYAN },
+  { "OAK ARROWS",    0,  520,  0,  0, 0 },
+  { "FIRE ARROWS",  10,  560, 36, 10, C_SKIN },
+  { "SILVER BOLTS", 25,  800, 44, 14, C_WHITE },
+  { "STORM STAFF",  50, 1400, 60, 18, C_CYAN },
 };
-#define WEAPON_OF(rank) ((rank) / 2)
+#define NWEAPONS ((int)SDL_arraysize(weapons))
+static int weapon_now(void) {
+  int w = 0;
+  while (w + 1 < NWEAPONS && G.streak >= weapons[w + 1].streak) w++;
+  return w;
+}
 
 // Boss monsters for the W A S D battles. Each one plays a little differently.
 typedef struct {
@@ -200,7 +219,13 @@ static void pick_word(Enemy *e) {
     e->word[0] = c; e->word[1] = 0;
   } else {
     Pool p;
-    if (e->kind == K_BAT) p = r <= 5 ? POOL(words3) : POOL(words5);
+    int roll = rndi(100);
+    int phrase = 0;   // 0 for a single word, else which phrase list
+    if (e->kind == K_BRUTE) phrase = r >= 6 ? 3 : 2;
+    else if (e->kind == K_ZOMBIE) phrase = r == 5 ? (roll < 25 ? 2 : 0) : r == 6 ? (roll < 40 ? 2 : 0)
+                                         : r == 7 ? (roll < 35 ? 2 : roll < 60 ? 3 : 0) : 0;
+    if (phrase) p = phrase == 3 ? POOL(phrases3) : POOL(phrases2);
+    else if (e->kind == K_BAT) p = r <= 5 ? POOL(words3) : POOL(words5);
     else if (e->kind == K_BRUTE) p = r <= 5 ? POOL(words7) : POOL(words10);
     else if (r == 3) p = POOL(words3);
     else if (r == 4) p = POOL(words5);
@@ -212,6 +237,9 @@ static void pick_word(Enemy *e) {
     SDL_strlcpy(e->word, w, sizeof(e->word));
   }
   e->len = (int)strlen(e->word);
+  e->words = 1;
+  for (int i = 0; i < e->len; i++) if (e->word[i] == ' ') e->words++;
+  e->hp = e->words;
 }
 
 static int count_alive(void) {
@@ -273,7 +301,7 @@ static void spark(float x, float y, Uint32 color) {
 
 // Upgraded weapons stagger the monsters around the one they hit.
 static void splash(const Enemy *hit) {
-  const Weapon *w = &weapons[WEAPON_OF(G.rank)];
+  const Weapon *w = &weapons[weapon_now()];
   if (!w->splash) return;
   for (int i = 0; i < MAX_EN; i++) {
     Enemy *o = &G.en[i];
@@ -284,18 +312,27 @@ static void splash(const Enemy *hit) {
   }
 }
 
-static void fire(float tx, float ty, int target, bool at_boss) {
-  (void)tx;
+// A shot that breaks one word of armour: it staggers the monster but does not kill.
+static void wound_enemy(Enemy *e) {
+  if (!e->alive || e->dying > 0) return;
+  e->hurt = 0.25f;
+  e->x = SDL_min(e->x + 14, 300.0f);
+  puff(e->x, enemy_y(e), C_WHITE, 5);
+  sfx(WAVE_NOISE, 0, 0, 0.07f, 0.16f, 0);
+  sfx(WAVE_SQUARE, 440, -600, 0.08f, 0.09f, 0);
+}
+
+static void fire_at(int target, bool at_boss, bool wound) {
   for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++)
     if (!G.bolts[i].on) {
-      G.bolts[i] = (Bolt){ true, 40, G.archer_y - 13, target, at_boss };
+      G.bolts[i] = (Bolt){ true, 40, G.archer_y - 13, target, at_boss, wound };
       G.shoot_t = 0.15f;
       return;
     }
   // No free bolt: resolve the hit immediately so nothing is lost.
-  if (!at_boss && target >= 0) kill_enemy(&G.en[target]);
-  (void)ty;
+  if (!at_boss && target >= 0) { if (wound) wound_enemy(&G.en[target]); else kill_enemy(&G.en[target]); }
 }
+static void fire(float tx, float ty, int target, bool at_boss) { (void)tx; (void)ty; fire_at(target, at_boss, false); }
 
 // ---- typing --------------------------------------------------------------------
 static int nearest_enemy(void) {
@@ -317,18 +354,29 @@ static void type_char(char c) {
     G.target = -1;
     for (int i = 0; i < MAX_EN; i++) {
       Enemy *o = &G.en[i];
-      if (o->alive && !o->doomed && o->word[o->typed] == c && (G.target < 0 || o->x < G.en[G.target].x)) G.target = i;
+      if (!o->alive || o->doomed) continue;
+      // Coming back to a half-typed phrase, the next word's first letter is enough.
+      bool match = o->word[o->typed] == c || (o->word[o->typed] == ' ' && o->word[o->typed + 1] == c);
+      if (match && (G.target < 0 || o->x < G.en[G.target].x)) G.target = i;
     }
-    if (G.target >= 0) e = &G.en[G.target];
+    if (G.target >= 0) { e = &G.en[G.target]; if (e->word[e->typed] == ' ' && c != ' ') e->typed++; }
   }
   if (!e || e->word[e->typed] != c) {
-    if (count_alive() == 0) return;   // nothing to type yet: not a mistake
+    if (c == ' ' || count_alive() == 0) return;   // a stray space, or nothing to type yet: not a mistake
+    if (weapon_now() > 0) say("STREAK BROKEN: OAK ARROWS", C_RED, 1.2f);
     G.wrong++; G.streak = 0;
     sfx(WAVE_SQUARE, 110, 0, 0.09f, 0.12f, 0);
     return;
   }
   e->typed++;
+  int had = weapon_now();
   G.correct++; G.streak++;
+  if (weapon_now() > had) {
+    char buf[40];
+    SDL_snprintf(buf, sizeof(buf), "%s!", weapons[weapon_now()].name);
+    say(buf, C_YELLOW, 1.4f);
+    for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(76 + k * 5), 0, 0.09f, 0.10f, k * 0.07f);
+  }
   G.key_times[G.key_head++ & 255] = G.tclock;
   int mult = 1 + G.streak / 10; if (mult > 5) mult = 5;
   G.score += 10 * mult;
@@ -339,6 +387,9 @@ static void type_char(char c) {
     e->doomed = true;
     fire(e->x, enemy_y(e), G.target, false);
     G.target = -1;
+  } else if (e->word[e->typed] == ' ') {   // a word is done: break one piece of armour
+    e->hp--;
+    fire_at(G.target, false, true);
   }
 }
 
@@ -452,16 +503,16 @@ static void boss_update(float dt) {
 // ---- game flow -------------------------------------------------------------------
 static void start_rank(int r) {
   float boss_timer = G.boss_timer;
-  int score = G.score, sel = G.sel;
+  int score = G.score, sel = G.sel, streak = G.streak;
   SDL_memset(&G, 0, sizeof(G));
-  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score;
+  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak;
   G.hp = MAX_HP; G.target = -1; G.last_lane = -1; G.ward = 1;
   G.spawn_t = 1.0f; G.archer_y = (float)LANE_Y(1);
   G.boss_timer = boss_timer > 0 ? boss_timer : BOSS_MIN_GAP + rndf() * BOSS_RANDOM_GAP;
   audio_song(SONG_TYPING);
 }
 
-static void new_game(int r) { G.score = 0; G.boss_timer = 0; start_rank(r); }
+static void new_game(int r) { G.score = 0; G.streak = 0; G.boss_timer = 0; start_rank(r); }
 
 // Pausing stops the audio device too, so the song clock that judges boss notes
 // freezes with the game and picks up exactly where it left off.
@@ -577,19 +628,21 @@ static void update(float dt) {
     if (b->at_boss) { tx = G.boss_x; ty = boss_cy(); }
     else if (b->target >= 0 && G.en[b->target].alive) { tx = G.en[b->target].x; ty = enemy_y(&G.en[b->target]); }
     else { b->on = false; continue; }
-    float dx = tx - b->x, dy = ty - b->y, d = sqrtf(dx * dx + dy * dy), stepd = weapons[WEAPON_OF(G.rank)].speed * dt;
+    float dx = tx - b->x, dy = ty - b->y, d = sqrtf(dx * dx + dy * dy), stepd = weapons[weapon_now()].speed * dt;
     if (d <= stepd + 4) {
       b->on = false;
       if (b->at_boss) { G.boss_flash = 0.1f; puff(tx - 8, ty, C_YELLOW, 3); }
+      else if (b->wound) wound_enemy(&G.en[b->target]);
       else { kill_enemy(&G.en[b->target]); splash(&G.en[b->target]); }
     } else {
       b->x += dx / d * stepd; b->y += dy / d * stepd;
-      if (weapons[WEAPON_OF(G.rank)].trail) spark(b->x - 4, b->y, weapons[WEAPON_OF(G.rank)].trail);
+      if (weapons[weapon_now()].trail) spark(b->x - 4, b->y, weapons[weapon_now()].trail);
     }
   }
   for (int i = 0; i < MAX_EN; i++) {
     Enemy *e = &G.en[i];
     if (e->alive && e->dying > 0) { e->dying -= dt; if (e->dying <= 0) e->alive = false; }
+    if (e->hurt > 0) e->hurt -= dt;
   }
 
   if (G.hp <= 0) {
@@ -670,7 +723,7 @@ static void draw_wall(void) {
 }
 
 static void draw_enemy(const Enemy *e, float bob) {
-  if (e->dying > 0 && ((int)(e->dying * 40) & 1)) return;
+  if ((e->dying > 0 && ((int)(e->dying * 40) & 1)) || (e->hurt > 0 && ((int)(e->hurt * 30) & 1))) return;
   int f = ((int)(e->anim * (e->kind == K_BAT ? 8 : 3))) & 1;
   if (e->kind == K_BAT) {
     Spr s = s_bat[f];
@@ -684,6 +737,30 @@ static void draw_enemy(const Enemy *e, float bob) {
   }
 }
 
+// Which word of its phrase position `pos` falls in.
+static int word_at(const Enemy *e, int pos) {
+  int w = 0;
+  for (int i = 0; i < pos && i < e->len; i++) if (e->word[i] == ' ') w++;
+  return w;
+}
+
+// Draws a monster's text with typed letters dimmed. A phrase is coloured word by
+// word to match its armour pips; the word being typed is the bright one.
+static void draw_words(float x, float y, const Enemy *e, int from, int to, bool targeted, int scale) {
+  for (int i = from; i < to; i++) {
+    int w = word_at(e, i), current = word_at(e, e->typed);
+    Uint32 color = i < e->typed ? C_DGREY
+                 : e->words == 1 ? (targeted ? C_YELLOW : C_WHITE)
+                 : w == current ? (targeted ? C_WHITE : word_colors[w % 4])
+                 : word_colors[w % 4];
+    char ch[2] = { e->word[i], 0 };
+    text(x + (float)((i - from) * FONT_W * scale), y, ch, color, scale);
+  }
+  // waiting on the space bar: blink a marker in the gap
+  if (targeted && e->word[e->typed] == ' ' && e->typed >= from && e->typed < to && ((int)(G.time * 6) & 1))
+    rect(x + (float)((e->typed - from) * FONT_W * scale), y + 6.0f * scale, 5.0f * scale, (float)scale, C_YELLOW);
+}
+
 static void draw_label(const Enemy *e, bool targeted) {
   if (e->doomed || e->rise < 0.3f) return;
   int w = text_w(e->word, 1) + 6;
@@ -691,11 +768,18 @@ static void draw_label(const Enemy *e, bool targeted) {
   float x = SDL_floorf(e->x - w / 2.0f), y = SDL_floorf(top - 12);
   if (x < 2) x = 2;
   if (x + w > SCREEN_W - 2) x = (float)(SCREEN_W - 2 - w);
+  Uint32 edge = !targeted ? C_DGREY : e->words > 1 ? word_colors[word_at(e, e->typed) % 4] : C_YELLOW;
   rect(x, y, (float)w, 11, C_BLACK);
-  frame(x, y, (float)w, 11, targeted ? C_YELLOW : C_DGREY);
-  float tx = text_n(x + 3, y + 2, e->word, e->typed, C_DGREY, 1);
-  text(tx, y + 2, e->word + e->typed, targeted ? C_YELLOW : C_WHITE, 1);
-  if (targeted && ((int)(G.time * 6) & 1)) rect(e->x - 1, y + 12, 3, 2, C_YELLOW);
+  frame(x, y, (float)w, 11, edge);
+  draw_words(x + 3, y + 2, e, 0, e->len, targeted, 1);
+  if (e->words > 1)   // armour pips: one per word, emptied as each word is typed
+    for (int k = 0; k < e->words; k++) {
+      float px = x + 1 + (float)(k * 6), py = y - 5;
+      rect(px, py, 5, 4, C_BLACK);
+      if (k >= e->words - e->hp) rect(px + 1, py + 1, 3, 2, word_colors[k % 4]);
+      else frame(px, py, 5, 4, C_DGREY);
+    }
+  if (targeted && ((int)(G.time * 6) & 1)) rect(e->x - 1, y + 12, 3, 2, edge);
 }
 
 static void draw_keyboard(char want) {
@@ -749,10 +833,21 @@ static void draw_typing_hud(void) {
   int i = G.target >= 0 ? G.target : nearest_enemy();
   if (i >= 0) {
     const Enemy *e = &G.en[i];
-    int scale = e->len > 8 ? 2 : 3;
-    float x = 222 - text_w(e->word, scale) / 2.0f, y = scale == 2 ? 212.0f : 208.0f;
-    float tx = text_n(x, y, e->word, e->typed, C_DGREY, scale);
-    text(tx, y, e->word + e->typed, G.target >= 0 ? C_YELLOW : C_WHITE, scale);
+    bool locked = G.target >= 0;
+    if (e->words == 1) {
+      int scale = e->len > 6 ? 2 : 3;
+      draw_words(238 - text_w(e->word, scale) / 2.0f, scale == 2 ? 212.0f : 208.0f, e, 0, e->len, locked, scale);
+    } else {
+      // A phrase: the word being typed is shown large, the whole phrase small beneath it.
+      int from = e->typed, to;
+      if (e->word[from] == ' ') text_center(238, 203, "SPACE", C_YELLOW, 2);
+      else {
+        while (from > 0 && e->word[from - 1] != ' ') from--;
+        for (to = from; to < e->len && e->word[to] != ' '; to++) {}
+        draw_words(238 - ((to - from) * FONT_W * 2 - 2) / 2.0f, 203, e, from, to, locked, 2);
+      }
+      draw_words(238 - text_w(e->word, 1) / 2.0f, 224, e, 0, e->len, locked, 1);
+    }
   }
 }
 
@@ -832,7 +927,7 @@ static void draw_play(void) {
       if (G.en[i].alive && G.en[i].lane == l) draw_enemy(&G.en[i], bob);
   if (boss) draw_boss();
   for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++)
-    if (G.bolts[i].on) spr(s_bolt[WEAPON_OF(G.rank)], G.bolts[i].x - 5, G.bolts[i].y - 1);
+    if (G.bolts[i].on) spr(s_bolt[weapon_now()], G.bolts[i].x - 5, G.bolts[i].y - 1);
   for (int i = 0; i < (int)SDL_arraysize(G.parts); i++)
     if (G.parts[i].life > 0) rect(G.parts[i].x, G.parts[i].y, 2, 2, G.parts[i].color);
   if (!boss)
@@ -851,6 +946,13 @@ static void draw_play(void) {
   for (int i = 0; i < MAX_HP; i++) {
     if (i < G.hp) spr(s_heart, (float)(236 + i * 8), 5);
     else rect((float)(238 + i * 8), 7, 3, 2, C_DGREY);
+  }
+
+  if (!boss) {   // current weapon, and how far the clean streak is from the next one
+    int w = weapon_now();
+    if (w + 1 < NWEAPONS) SDL_snprintf(buf, sizeof(buf), "%s  STREAK %d/%d", weapons[w].name, G.streak, weapons[w + 1].streak);
+    else SDL_snprintf(buf, sizeof(buf), "%s  STREAK %d", weapons[w].name, G.streak);
+    text_shadow(4, 20, buf, w ? weapons[w].trail : C_GREY, 1);
   }
 
   // bottom panel
@@ -914,10 +1016,6 @@ static void draw_banner(void) {
     SDL_snprintf(buf, sizeof(buf), "YOU ARE NOW A %s", ranks[G.rank + 1].name);
     text_center(160, 90, buf, C_WHITE, 1);
     text_center(160, 102, ranks[G.rank + 1].blurb, C_CYAN, 1);
-    if (WEAPON_OF(G.rank + 1) != WEAPON_OF(G.rank)) {
-      SDL_snprintf(buf, sizeof(buf), "NEW WEAPON: %s", weapons[WEAPON_OF(G.rank + 1)].name);
-      text_center(160, 113, buf, C_YELLOW, 1);
-    }
     text_center(160, 164, "ENTER: NEXT NIGHT", C_WHITE, 1);
   }
   SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
@@ -937,7 +1035,8 @@ static void update_status(void) {
   else if (G.sub == SUB_BOSS) SDL_snprintf(buf, sizeof(buf), "Boss battle: hit the arrow keys on the beat.");
   else {
     char c = G.sub == SUB_TYPING ? next_char() : 0;
-    if (c) SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Type %c", G.rank + 1, R->name, G.kills, R->quota, c);
+    if (c == ' ') SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Press the space bar.", G.rank + 1, R->name, G.kills, R->quota);
+    else if (c) SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Type %c", G.rank + 1, R->name, G.kills, R->quota, c);
     else SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d.", G.rank + 1, R->name, G.kills, R->quota);
   }
   set_status(buf);
@@ -1007,6 +1106,7 @@ static void key_down(SDL_Keycode key) {
         else if (key == SDLK_D || key == SDLK_RIGHT) boss_press(3);
       } else if (G.sub == SUB_TYPING) {
         if (key >= SDLK_A && key <= SDLK_Z) type_char((char)('A' + (key - SDLK_A)));
+        else if (key == SDLK_SPACE) type_char(' ');
         else if (key == SDLK_BACKSPACE) G.target = -1;
       }
       break;
