@@ -4,26 +4,26 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#0b0f2a" />
-    <title>Spark Island · vibeCDA starter</title>
+    <title>Home Row Horde</title>
   </head>
   <body>
     <main>
-      <nav aria-label="Starter examples">
-        <a href="?demo=2d">Phaser 2D game</a>
-        <a href="?demo=3d">Three.js 3D demo</a>
-      </nav>
       <header>
-        <p class="eyebrow">vibeCDA starter / Phaser 2D</p>
-        <h1>Spark <span class="accent">Island</span></h1>
-        <p class="lead">A wizard, a lizard, and a floating island. Collect all eight sparks.</p>
+        <p class="eyebrow">vibeCDA 2026 / C + SDL3</p>
+        <h1>Home Row <span class="accent">Horde</span></h1>
+        <p class="lead">The dead are climbing out of the forest. Type to hold the wall.</p>
       </header>
-      <div class="toolbar">
-        <p id="score" role="status" aria-live="polite">Sparks: 0 / 8</p>
-        <button id="restart" type="button">Restart game</button>
+      <p id="score" role="status" aria-live="polite">Loading the game…</p>
+      <div id="game">
+        <canvas id="canvas" tabindex="0" aria-label="Home Row Horde game. Needs a keyboard: type the letters and words above the zombies."></canvas>
       </div>
-      <div id="game" role="application" aria-label="Spark Island game. Move using arrow keys or W A S D, or hold a location on the game."></div>
-      <p id="instructions">Move with <kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd> or <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd>. On a phone, hold where you want to go.</p>
-      <footer>Start changing <code>src/game.ts</code>. Your idea goes here.</footer>
+      <p id="instructions">
+        Click the game, then press <kbd>Enter</kbd>. Type the letter or word above a zombie to shoot it.
+        When the Pumpkin King arrives, move to <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> (or the arrow keys)
+        and hit the arrows on the beat. <kbd>Backspace</kbd> drops your target; <kbd>Esc</kbd> returns to the title.
+        This game needs a physical keyboard.
+      </p>
+      <footer>Written in C on SDL3 and compiled to WebAssembly. Art and music are generated in code.</footer>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>

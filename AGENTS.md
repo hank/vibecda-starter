@@ -1,9 +1,20 @@
 # vibeCDA starter instructions
 
-This repository contains Phaser 3 and Three.js browser examples using Vite and
-TypeScript, plus public participant guides. Participant game changes belong in
-src/ and public/. The Three.js example is src/three-game.ts; both engines are
-installed in the default Codespace.
+This branch holds Home Row Horde, a typing defence game written in C on SDL3
+(src/sdl/) and compiled to WebAssembly with Emscripten. Vite and TypeScript only
+provide the page around the canvas (index.html, src/main.ts, src/style.css).
+The Phaser and Three.js starter demos were removed from src/; their packages and
+the participant guides in docs/ are left as they were in the starter.
+
+- npm run native builds build/home-row-horde for quick local play (needs SDL3).
+  npm run wasm writes public/game.js and public/game.wasm, using emcc if it is
+  on PATH and the emscripten/emsdk Docker image otherwise. Run npm run wasm
+  before npm run build or npm run package after changing any C code.
+- Headless checks of the native build: SDL_VIDEODRIVER=offscreen with
+  HRH_FRAMES=n, HRH_RANK=1..8, HRH_BOT=keys-per-second, HRH_BOSS=1, and
+  HRH_SHOT=file.bmp to save the last frame.
+- The browser tests read the status line above the canvas, which the game
+  updates from C (set_status in src/sdl/game.c). Keep the two in step.
 
 - Read package.json before installing anything. The devcontainer already has
   Node, Claude Code, Codex, Gemini CLI, Chromium/Playwright, ffmpeg, ImageMagick,

@@ -57,13 +57,9 @@ body::before {
   opacity: .85;
 }
 
-/* 846px leaves the game exactly 800px wide: two screen pixels per game pixel. */
-main { position: relative; max-width: 846px; margin: auto; padding: 1rem 20px 3rem; }
+/* 1006px leaves the game exactly 960px wide: three screen pixels per game pixel. */
+main { position: relative; max-width: 1006px; margin: auto; padding: 1rem 20px 3rem; }
 
-nav { display: flex; flex-wrap: wrap; justify-content: center; gap: .4rem; margin-bottom: 1.5rem; }
-nav a { padding: .6rem .7rem; font: .58rem/1.6 var(--pixel-font); color: var(--text); text-decoration: none; border-radius: 8px; }
-nav a:hover { background: var(--panel-2); color: var(--cyan); }
-nav a[aria-current] { color: var(--bg-deep); background: var(--gold); }
 a:focus-visible, button:focus-visible { outline: 3px solid var(--gold); outline-offset: 4px; }
 
 header { text-align: center; }
@@ -72,18 +68,12 @@ h1 { font: 400 clamp(1.1rem, 4.5vw, 1.9rem)/1.6 var(--pixel-font); letter-spacin
 .accent { color: var(--cyan); }
 .lead { color: var(--muted); font-size: 1.1rem; margin: 0; }
 
-.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; margin: 1.5rem 0 1rem; }
-#score { margin: 0 auto 0 0; font: .68rem/1.8 var(--pixel-font); color: var(--gold); }
+#score { margin: 1.5rem 0 1rem; font: .68rem/1.8 var(--pixel-font); color: var(--gold); min-height: 1.8em; }
 
-button { font: .6rem/1.7 var(--pixel-font); padding: .8rem 1rem; border-radius: 8px; border: 3px solid var(--border); background: var(--panel); color: var(--cyan); cursor: pointer; }
-button:hover { border-color: var(--cyan-dim); background: var(--panel-2); }
-#restart { border-color: var(--cyan); background: linear-gradient(#1ee8ff, #0ab8d4); color: #041018; box-shadow: 0 4px 0 #067a8c, 0 0 20px #3de0ff33; }
-#restart:hover { filter: brightness(1.08); }
-#restart:active { transform: translateY(2px); box-shadow: 0 2px 0 #067a8c, 0 0 20px #3de0ff33; }
-
-#game { width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border: 3px solid var(--border); border-radius: 12px; background: var(--bg-deep); box-shadow: 0 12px 40px #0007, 0 0 60px #3de0ff14; touch-action: none; }
-canvas { display: block; }
-canvas:focus-visible { outline: 3px solid var(--gold); outline-offset: -5px; }
+#game { width: 100%; aspect-ratio: 4 / 3; overflow: hidden; border: 3px solid var(--border); border-radius: 12px; background: #000; box-shadow: 0 12px 40px #0007, 0 0 60px #3de0ff14; }
+/* SDL draws at 960 x 720; the page scales that to fit and keeps the pixels crisp. */
+canvas { display: block; width: 100% !important; height: 100% !important; image-rendering: pixelated; outline: none; }
+#game:focus-within { border-color: var(--gold); }
 
 #instructions { color: var(--muted); font-size: .95rem; margin: 1rem 0 0; }
 kbd, code { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: .9em; color: var(--cyan); background: var(--bg-deep); padding: .15rem .4rem; border: 1px solid var(--border); border-radius: 4px; }
@@ -91,6 +81,5 @@ footer { text-align: center; border-top: 2px solid var(--border); margin-top: 2r
 
 @media (max-width: 560px) {
   main { padding: .75rem 12px 2rem; }
-  nav a { font-size: .5rem; }
   #score { font-size: .58rem; }
 }

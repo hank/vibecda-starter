@@ -1,12 +1,23 @@
 import './style.css';
 
-// Both engines ship in the default workspace. Load the one selected in the page.
-if (new URLSearchParams(location.search).get('demo') === '3d') {
-  import('./three-game').catch(error => {
-    document.querySelector('#score')!.textContent = '3D could not start. Try a current browser with WebGL 2 enabled.';
-    console.error(error);
-  });
-} else {
-  document.querySelector('a[href="?demo=2d"]')?.setAttribute('aria-current', 'page');
-  import('./phaser-game');
-}
+// The game is C on SDL3, compiled to WebAssembly by `npm run wasm`, which writes
+// game.js and game.wasm into public/. Emscripten reads its settings from a
+// global Module object, which has to exist before game.js runs.
+const canvas = document.querySelector<HTMLCanvasElement>('#canvas')!;
+const status = document.querySelector<HTMLElement>('#score')!;
+
+(window as unknown as { Module: object }).Module = {
+  canvas,
+  print: (line: string) => console.log(line),
+  printErr: (line: string) => console.warn(line),
+};
+
+const script = document.createElement('script');
+script.src = './game.js';   // relative, so the build works in itch.io's iframe and in subdirectories
+script.onerror = () => {
+  status.textContent = 'The game could not load. Run "npm run wasm" to build it first.';
+};
+document.body.append(script);
+
+// Keys go to the game once it has focus; clicking anywhere on it is enough.
+canvas.addEventListener('pointerdown', () => canvas.focus());
