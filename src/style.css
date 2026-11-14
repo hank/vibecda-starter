@@ -70,9 +70,9 @@ h1 { font: 400 clamp(1.1rem, 4.5vw, 1.9rem)/1.6 var(--pixel-font); letter-spacin
 
 #score { margin: 1.5rem 0 1rem; font: .68rem/1.8 var(--pixel-font); color: var(--gold); min-height: 1.8em; }
 
-#game { width: 100%; aspect-ratio: 4 / 3; overflow: hidden; border: 3px solid var(--border); border-radius: 12px; background: #000; box-shadow: 0 12px 40px #0007, 0 0 60px #3de0ff14; }
+#game { width: 100%; overflow: hidden; border: 3px solid var(--border); border-radius: 12px; background: #000; box-shadow: 0 12px 40px #0007, 0 0 60px #3de0ff14; }
 /* SDL draws at 960 x 720; the page scales that to fit and keeps the pixels crisp. */
-canvas { display: block; width: 100% !important; height: 100% !important; image-rendering: pixelated; outline: none; }
+canvas { display: block; width: 100% !important; height: auto !important; aspect-ratio: 4 / 3; image-rendering: pixelated; outline: none; }
 #game:focus-within { border-color: var(--gold); }
 
 #instructions { color: var(--muted); font-size: .95rem; margin: 1rem 0 0; }

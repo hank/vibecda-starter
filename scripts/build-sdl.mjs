@@ -28,7 +28,7 @@ if (target === 'native') {
   if (has('emcc')) run('emcc', emcc);
   else if (has('docker')) {
     const { uid, gid } = userInfo();
-    run('docker', ['run', '--rm', '-u', `${uid}:${gid}`, '-e', 'EM_CACHE=/src/build/emcache',
+    run('docker', ['run', '--rm', '-u', `${uid}:${gid}`,
       '-v', `${process.cwd()}:/src`, '-w', '/src', EMSDK_IMAGE, 'emcc', ...emcc]);
   } else {
     console.error('The wasm build needs Emscripten (emcc) or Docker. See https://emscripten.org/docs/getting_started/downloads.html');

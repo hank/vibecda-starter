@@ -853,8 +853,13 @@ static void draw(void) {
   SDL_SetRenderTarget(ren, NULL);
   int ow, oh;
   SDL_GetRenderOutputSize(ren, &ow, &oh);
+#ifdef __EMSCRIPTEN__
+  // The page sizes the canvas, so fill it exactly; CSS keeps the pixels crisp.
+  float scale = SDL_min((float)ow / SCREEN_W, (float)oh / SCREEN_H);
+#else
   int scale = SDL_min(ow / SCREEN_W, oh / SCREEN_H);
   if (scale < 1) scale = 1;
+#endif
   float sx = G.shake > 0 ? (float)(rndi(3) - 1) * scale : 0, sy = G.shake > 0 ? (float)(rndi(3) - 1) * scale : 0;
   SDL_FRect dst = { (ow - SCREEN_W * scale) / 2.0f + sx, (oh - SCREEN_H * scale) / 2.0f + sy,
                     (float)(SCREEN_W * scale), (float)(SCREEN_H * scale) };
