@@ -45,6 +45,8 @@ static struct {
   double clock;              // smoothed playback position, in seconds of samples
   double latency;            // estimated delay between that position and the speakers
   int offset_ms;             // the player's own adjustment, from calibration or the pause screen
+  int visual_ms;             // how far ahead arrows are drawn, to cancel the display's own delay
+  bool song_muted;           // the song keeps time but is silent (sight calibration)
   Uint64 pump_ns;            // when the clock was last advanced, for timing key presses between frames
   int song, step;
   Sint64 song_start;         // sample index where the current song began
@@ -132,6 +134,7 @@ static float audio_sample(void) {
     float n = noise1();
     out += n * A.snare_env * 0.12f; A.snare_env *= 0.9996f;
     out += n * A.hat_env * 0.035f;  A.hat_env *= 0.9975f;
+    if (A.song_muted) out = 0;
   }
   for (int i = 0; i < (int)SDL_arraysize(A.sfx); i++) {
     Sfx *s = &A.sfx[i];
@@ -184,13 +187,17 @@ static void audio_pump(float dt) {
     SDL_PutAudioStreamData(A.stream, buf, sizeof(buf));
     A.generated += 512; queued += 512;
   }
-  // The raw position moves in buffer-sized jumps. Advance a steady clock with
-  // frame time and pull it gently toward the raw position so it cannot drift.
+  // The raw position moves in buffer-sized jumps, so (as StepMania does) run a
+  // steady clock from the high-resolution timer between updates and only pull
+  // it slowly toward the raw position, which stops it drifting without
+  // letting the jumps through.
+  (void)dt;
+  Uint64 now = SDL_GetTicksNS();
   double raw = (double)(A.generated - SDL_GetAudioStreamQueued(A.stream) / (int)sizeof(float)) / SR;
-  A.clock += dt;
+  if (A.pump_ns) A.clock += (double)(now - A.pump_ns) / 1e9;
   double err = raw - A.clock;
-  if (err > 0.15 || err < -0.15) A.clock = raw; else A.clock += err * 0.05;
-  A.pump_ns = SDL_GetTicksNS();
+  if (!A.pump_ns || err > 0.12 || err < -0.12) A.clock = raw; else A.clock += err * 0.02;
+  A.pump_ns = now;
 }
 
 // Seconds into the current song as it is heard, before the player's own offset.

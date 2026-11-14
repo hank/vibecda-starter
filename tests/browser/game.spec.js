@@ -60,29 +60,58 @@ test('a higher rank can be chosen from the title and uses whole words', async ({
   await expect(status).toContainText('Slain 1/16');
 });
 
-test('F2 opens beat calibration, and tapping along measures and saves a delay', async ({ page }) => {
+test('F2 opens two-step beat calibration, and the measured delay is saved', async ({ page }) => {
   await page.goto('/');
   const status = page.getByRole('status');
   await expect(status).toHaveText(TITLE);
   await page.locator('canvas').click();
   await page.keyboard.press('F2');
-  await expect(status).toHaveText('Beat calibration. Tap space on every beat. Saved delay 0 ms.');
-  // Nudging changes the saved delay, and it survives a reload.
+  await expect(status).toHaveText('Beat calibration, sound step. Tap space on every beat. Sound 0 ms, sight 20 ms.');
   await page.keyboard.press('Equal');
   await page.keyboard.press('Equal');
-  await expect(status).toContainText('Saved delay 10 ms.');
+  await expect(status).toContainText('Sound 4 ms');
   // Tap steadily for a while (half a second apart, like the click), then save what was measured.
   await page.waitForTimeout(1200);
   for (let i = 0; i < 10; i++) { await page.keyboard.press('Space'); await page.waitForTimeout(500); }
   await page.keyboard.press('Enter');
-  await expect(status).not.toContainText('Saved delay 10 ms.');
-  const saved = (await status.textContent()).match(/Saved delay (-?\d+) ms/)[1];
+  // Saving the sound delay moves on to the sight step.
+  await expect(status).toContainText('sight step');
+  await expect(status).not.toContainText('Sound 4 ms');
+  const saved = (await status.textContent()).match(/Sound (-?\d+) ms/)[1];
+  await page.keyboard.press('Minus');
+  await expect(status).toContainText('sight 18 ms');
   await page.reload();
   await page.locator('canvas').click();
   await page.keyboard.press('F2');
-  await expect(status).toContainText(`Saved delay ${saved} ms.`);
+  await expect(status).toContainText(`Sound ${saved} ms, sight 18 ms.`);
   await page.keyboard.press('Escape');
   await expect(status).toHaveText(TITLE);
+});
+
+test('F6 saves the game and F7 loads it back, paused, even after a reload', async ({ page }) => {
+  await page.goto('/');
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText('Rank 1 SPROUT. Slain 0/12. Type F');
+  await page.keyboard.press('f');
+  await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
+  await page.keyboard.press('F6');
+  await page.keyboard.press('j');
+  await expect(status).toContainText('Slain 2/12');
+  await page.keyboard.press('F7');
+  await expect(status).toHaveText('Paused. Press Enter to keep playing.');
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
+  // The save outlives the page: load straight from the title screen.
+  await page.reload();
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('F7');
+  await expect(status).toHaveText('Paused. Press Enter to keep playing.');
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
 });
 
 test('the canvas scales down to phone width without losing its shape', async ({ page }) => {

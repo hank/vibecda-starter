@@ -101,6 +101,9 @@ typedef struct {
 } Enemy;
 typedef struct { bool on; float x, y; int target; bool at_boss, wound; } Bolt;
 typedef struct { float x, y, vx, vy, life; Uint32 color; } Particle;
+static int last_boss = -1;
+static int autosync;
+static void offset_set(int ms);
 typedef struct { int step, col, state; } Note;   // state: 0 pending, 1 hit, 2 missed
 
 static struct {
@@ -118,6 +121,7 @@ static struct {
   char msg[40]; float msg_t; Uint32 msg_color;
   // boss battle
   Note notes[DANCE_STEPS]; int nnotes, boss_hp, boss_max, hits, misses, combo;
+  float sync_sum, sync_sq; int sync_n;   // signed timing of this battle's hits, for the summary and AutoSync
   float boss_x, boss_flash, press_flash[4], hit_flash[4], out_t;
   Uint32 hit_color[4];
   char judge_sub[16];
@@ -165,7 +169,7 @@ static const Boss bosses[] = {
   { "THE LICH",     "HIS ARROWS APPEAR LATE",     { &s_lich, &s_lich },                 2, false, 100, 60, 118, C_CYAN },
 };
 #define NBOSSES ((int)SDL_arraysize(bosses))
-static int last_boss = -1, force_boss = -1;
+static int force_boss = -1;
 static Uint64 last_ns;
 static Uint32 rng_state = 0xC0FFEE;
 
@@ -435,7 +439,7 @@ static void boss_start(void) {
   if (force_boss >= 0) G.boss_kind = force_boss % NBOSSES;
   last_boss = G.boss_kind;
   G.boss_max = G.boss_hp = (G.nnotes * bosses[G.boss_kind].need_pct + 99) / 100;
-  G.hits = G.misses = G.combo = 0; G.boss_x = 350; G.boss_won = false; G.judge_t = 0;
+  G.hits = G.misses = G.combo = 0; G.sync_sum = G.sync_sq = 0; G.sync_n = 0; G.boss_x = 350; G.boss_won = false; G.judge_t = 0;
   audio_song(SONG_DANCE);
   sfx(WAVE_SQUARE, 110, 0, 0.5f, 0.12f, 0);
   sfx(WAVE_SQUARE, 104, 0, 0.5f, 0.12f, 0);
@@ -455,6 +459,19 @@ static void boss_end(bool won) {
     sfx(WAVE_SQUARE, 220, -150, 0.6f, 0.12f, 0);
   }
   G.boss_timer = BOSS_MIN_GAP + rndf() * BOSS_RANDOM_GAP;
+  // Report how the presses sat against the beat. With AutoSync on, and only when
+  // they were consistent, shift the sound delay toward them a little.
+  if (G.sync_n >= 8 && T.bot <= 0) {
+    float mean = G.sync_sum / G.sync_n, var = G.sync_sq / G.sync_n - mean * mean;
+    float sd = var > 0 ? sqrtf(var) : 0;
+    int ms = (int)lroundf(mean * 1000);
+    char buf[40];
+    if (autosync && G.sync_n >= 12 && sd < 0.035f && ms != 0) {
+      offset_set(A.offset_ms + SDL_clamp(ms, -20, 20));
+      SDL_snprintf(buf, sizeof(buf), "AUTOSYNC: DELAY %+d MS", A.offset_ms);
+    } else SDL_snprintf(buf, sizeof(buf), "AVERAGE %d MS %s", abs(ms), ms >= 0 ? "LATE" : "EARLY");
+    say(buf, C_CYAN, 2.5f);
+  }
 }
 
 static void boss_judge(const char *label, Uint32 color) {
@@ -472,6 +489,7 @@ static void boss_press(int col) {
     double off = t - note_time(n), d = fabs(off);   // positive: pressed late
     if (d > good) continue;
     n->state = 1; G.hits++; G.combo++;
+    G.sync_sum += (float)off; G.sync_sq += (float)(off * off); G.sync_n++;
     int tier = d <= 0.045 ? 0 : d <= 0.09 ? 1 : 2;
     static const char *const names[3] = { "PERFECT", "GREAT", "GOOD" };
     static const Uint32 colors[3] = { C_YELLOW, C_ZOMBIE, C_CYAN };
@@ -527,70 +545,164 @@ static void set_paused(bool paused) {
 }
 
 // The beat-timing adjustment is remembered between visits on the web.
-static void offset_file(char *path, size_t n) {
+static void pref_file(const char *name, char *path, size_t n) {
   char *dir = SDL_GetPrefPath("vibecda", "home-row-horde");
-  SDL_snprintf(path, n, "%sbeat-offset.txt", dir ? dir : "");
+  SDL_snprintf(path, n, "%s%s", dir ? dir : "", name);
   SDL_free(dir);
 }
-// The beat offset is remembered: in localStorage on the web, in a small file natively.
-static void offset_set(int ms) {
-  A.offset_ms = SDL_clamp(ms, -250, 250);
+
+// Sync settings are remembered: in localStorage on the web, in a small file natively.
+static int autosync;   // 1: nudge the sound delay after each boss battle, as StepMania's AutoSync does
+static void settings_save(void) {
 #ifdef __EMSCRIPTEN__
-  EM_ASM({ try { localStorage.setItem('hrh-beat-offset', String($0)); } catch (e) {} }, A.offset_ms);
+  EM_ASM({ try { localStorage.setItem('hrh-sync', $0 + ',' + $1 + ',' + $2); } catch (e) {} }, A.offset_ms, A.visual_ms, autosync);
 #else
   if (T.on) return;
-  char path[512]; offset_file(path, sizeof(path));
+  char path[512]; pref_file("sync.txt", path, sizeof(path));
   FILE *f = fopen(path, "w");
-  if (f) { fprintf(f, "%d\n", A.offset_ms); fclose(f); }
+  if (f) { fprintf(f, "%d %d %d\n", A.offset_ms, A.visual_ms, autosync); fclose(f); }
 #endif
 }
-static void offset_change(int delta) { offset_set(A.offset_ms + delta); }
-static void offset_load(void) {
+static void settings_load(void) {
+  A.visual_ms = 20;   // about a frame of display delay until it is measured
 #ifdef __EMSCRIPTEN__
-  A.offset_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-beat-offset') || '0', 10) || 0; } catch (e) { return 0; } });
+  int found = EM_ASM_INT({ try { return (localStorage.getItem('hrh-sync') || '').split(',').length == 3 ? 1 : 0; } catch (e) { return 0; } });
+  if (found) {
+    A.offset_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[0], 10) || 0; } catch (e) { return 0; } });
+    A.visual_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[1], 10) || 0; } catch (e) { return 0; } });
+    autosync = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[2], 10) || 0; } catch (e) { return 0; } });
+  }
 #else
   if (T.on) return;
-  char path[512]; offset_file(path, sizeof(path));
+  char path[512]; pref_file("sync.txt", path, sizeof(path));
   FILE *f = fopen(path, "r");
-  if (f) { if (fscanf(f, "%d", &A.offset_ms) != 1) A.offset_ms = 0; fclose(f); }
+  if (f) {
+    int o, v, a;
+    if (fscanf(f, "%d %d %d", &o, &v, &a) == 3) { A.offset_ms = o; A.visual_ms = v; autosync = a; }
+    fclose(f);
+  }
 #endif
   A.offset_ms = SDL_clamp(A.offset_ms, -250, 250);
+  A.visual_ms = SDL_clamp(A.visual_ms, -100, 200);
+  autosync = autosync ? 1 : 0;
 }
+static void offset_set(int ms) { A.offset_ms = SDL_clamp(ms, -250, 250); settings_save(); }
+static void offset_change(int delta) { offset_set(A.offset_ms + delta); }
+static void visual_set(int ms) { A.visual_ms = SDL_clamp(ms, -100, 200); settings_save(); }
 
 // ---- beat calibration ----------------------------------------------------------------
-// A plain 4/4 click plays; the player taps along and the average distance between
-// taps and beats becomes the beat offset used to judge and draw boss arrows.
+// Two steps, because sound and picture are delayed by different amounts.
+// SOUND: a plain 4/4 click plays and the player taps along by ear; the average
+//   distance from the beat becomes the sound delay used to judge presses.
+// SIGHT: the click is silent and the player taps when a rising arrow fills the
+//   receptor; the average becomes how far ahead arrows are drawn, so that what
+//   is seen lines up with what is heard.
 #define CAL_TAPS 16
 #define CAL_BEAT (DANCE_STEP_SEC * 2)
-static struct { int n; float err[CAL_TAPS]; float last, flash; } Cal;
+enum { CAL_SOUND, CAL_SIGHT };
+static struct { int mode, n; float err[CAL_TAPS]; float last, flash; } Cal;
 
-static void calibrate_start(void) {
+static void calibrate_mode(int mode) {
   SDL_memset(&Cal, 0, sizeof(Cal));
-  G.state = ST_CALIBRATE; G.state_t = 0;
+  Cal.mode = mode;
+  A.song_muted = mode == CAL_SIGHT;
+  G.state_t = 0;
+}
+static void calibrate_start(void) {
+  G.state = ST_CALIBRATE;
+  calibrate_mode(CAL_SOUND);
   audio_song(SONG_CALIBRATE);
 }
 static int cal_count(void) { return Cal.n < CAL_TAPS ? Cal.n : CAL_TAPS; }
+// The mean of the taps, leaving out the two earliest and two latest once there
+// are enough, so one stumble does not skew the result.
 static float cal_mean(void) {
-  float sum = 0; int n = cal_count();
-  for (int i = 0; i < n; i++) sum += Cal.err[i];
-  return n ? sum / n : 0;
+  float v[CAL_TAPS], sum = 0; int n = cal_count();
+  for (int i = 0; i < n; i++) v[i] = Cal.err[i];
+  for (int a = 0; a < n; a++) for (int b = a + 1; b < n; b++) if (v[b] < v[a]) { float t = v[a]; v[a] = v[b]; v[b] = t; }
+  int trim = n >= 10 ? 2 : 0;
+  for (int i = trim; i < n - trim; i++) sum += v[i];
+  return n ? sum / (float)(n - 2 * trim) : 0;
 }
 static float cal_spread(void) {
   float m = cal_mean(), sum = 0; int n = cal_count();
   for (int i = 0; i < n; i++) sum += (Cal.err[i] - m) * (Cal.err[i] - m);
   return n > 1 ? sqrtf(sum / (n - 1)) : 0;
 }
+// What saving now would store for the current step.
+static int cal_result(void) {
+  int ms = (int)lroundf(cal_mean() * 1000);
+  return Cal.mode == CAL_SOUND ? ms : A.visual_ms + ms;
+}
 static void calibrate_tap(void) {
-  double t = audio_raw_time_at(key_ts);
+  // Sound taps are measured against the raw clock; sight taps against the
+  // clock as already corrected for sound, so the two delays stay separate.
+  double t = Cal.mode == CAL_SOUND ? audio_raw_time_at(key_ts) : audio_song_time_at(key_ts);
   double e = t - floor(t / CAL_BEAT + 0.5) * CAL_BEAT;   // distance from the nearest beat
   Cal.last = (float)e; Cal.flash = 0.12f;
   if (G.state_t < 1.0f) return;                          // let the click settle first
   Cal.err[Cal.n++ % CAL_TAPS] = (float)e;
 }
 
+// ---- save and load -------------------------------------------------------------------
+// F6 stores the whole game in progress; F7 brings it back, paused.
+typedef struct { Uint32 magic, size; int last_boss; } SaveHead;
+#define SAVE_MAGIC 0x48524831u
+static struct { SaveHead head; char game[sizeof(G)]; } save_buf;
+
+static void save_game(void) {
+  if (G.state != ST_PLAY) { say("NOTHING TO SAVE YET", C_GREY, 1.5f); return; }
+  save_buf.head = (SaveHead){ SAVE_MAGIC, (Uint32)sizeof(G), last_boss };
+  SDL_memcpy(save_buf.game, &G, sizeof(G));
+  bool ok = false;
+#ifdef __EMSCRIPTEN__
+  ok = EM_ASM_INT({ try {
+    var b = HEAPU8.subarray($0, $0 + $1);
+    var s = '';
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    localStorage.setItem('hrh-save', btoa(s)); return 1;
+  } catch (e) { return 0; } }, &save_buf, (int)sizeof(save_buf));
+#else
+  char path[512]; pref_file("save.dat", path, sizeof(path));
+  FILE *f = fopen(path, "wb");
+  if (f) { ok = fwrite(&save_buf, sizeof(save_buf), 1, f) == 1; fclose(f); }
+#endif
+  say(ok ? "GAME SAVED" : "COULD NOT SAVE", ok ? C_ZOMBIE : C_RED, 1.5f);
+  if (ok) sfx(WAVE_SQUARE, 880, 400, 0.12f, 0.1f, 0);
+}
+
+static void set_paused(bool paused);
+static void load_game(void) {
+  bool ok = false;
+#ifdef __EMSCRIPTEN__
+  ok = EM_ASM_INT({ try {
+    var s = localStorage.getItem('hrh-save'); if (!s) return 0;
+    s = atob(s); if (s.length != $1) return 0;
+    for (var i = 0; i < s.length; i++) HEAPU8[$0 + i] = s.charCodeAt(i);
+    return 1;
+  } catch (e) { return 0; } }, &save_buf, (int)sizeof(save_buf));
+#else
+  char path[512]; pref_file("save.dat", path, sizeof(path));
+  FILE *f = fopen(path, "rb");
+  if (f) { ok = fread(&save_buf, sizeof(save_buf), 1, f) == 1; fclose(f); }
+#endif
+  // A save from a different version of the game has a different size and is refused.
+  if (!ok || save_buf.head.magic != SAVE_MAGIC || save_buf.head.size != sizeof(G)) { say("NO SAVED GAME FOUND", C_RED, 1.5f); return; }
+  SDL_memcpy(&G, save_buf.game, sizeof(G));
+  last_boss = save_buf.head.last_boss;
+  A.song_muted = false;
+  // A battle cannot be rejoined mid-song: the boss returns a few seconds after loading instead.
+  if (G.sub != SUB_TYPING) { G.sub = SUB_TYPING; G.boss_timer = 4; }
+  for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++) if (G.bolts[i].at_boss) G.bolts[i].on = false;
+  audio_song(SONG_TYPING);
+  say("GAME LOADED", C_ZOMBIE, 1.5f);
+  set_paused(true);   // start paused, so there is time to get hands on the keys
+}
+
 static void go_title(void) {
   int sel = G.sel;
   set_paused(false);
+  A.song_muted = false;
   SDL_memset(&G, 0, sizeof(G));
   G.state = ST_TITLE; G.sel = sel; G.target = -1;
   audio_song(SONG_TYPING);
@@ -919,41 +1031,48 @@ static void draw_arrow(float cx, float cy, float size, int col, Uint32 rgb, int 
 static void draw_calibrate(void) {
   char buf[64];
   int n = cal_count();
-  int measured = (int)lroundf(cal_mean() * 1000);
-  // Preview the result: once there are a few taps, the arrow follows the measured delay.
-  double t = audio_raw_time_at(0) - (n >= 4 ? measured : A.offset_ms) / 1000.0;
+  bool sight = Cal.mode == CAL_SIGHT;
+  double t = audio_song_time() + A.visual_ms / 1000.0;
   double beat = t / CAL_BEAT, phase = beat - floor(beat);
   SDL_RenderTexture(ren, bg_tex, NULL, NULL);
   overlay(190);
-  text_center(160, 10, "BEAT CALIBRATION", C_YELLOW, 2);
-  text_center(160, 32, "TAP SPACE OR AN ARROW KEY ON EVERY BEAT", C_WHITE, 1);
-  rect_a(144, 46, 32, 96, 0x101028, 255);
-  int v = Cal.flash > 0 ? 255 : 100 + (int)(110 * (1 - phase) * (1 - phase));
-  draw_arrow(160, 58, 14, 2, (Uint32)(v << 16 | v << 8 | v), 255);
-  SDL_Rect clip = { 144, 46, 32, 96 };
-  SDL_SetRenderClipRect(ren, &clip);
-  for (int k = 0; k < 3; k++) draw_arrow(160, 58 + (float)((k + 1 - phase) * CAL_BEAT) * 90, 14, 2, 0xF83800, 255);
-  SDL_SetRenderClipRect(ren, NULL);
+  text_center(160, 8, "BEAT CALIBRATION", C_YELLOW, 2);
+  text_center(160, 28, sight ? "STEP 2 OF 2: SIGHT (THE CLICK IS SILENT)" : "STEP 1 OF 2: SOUND", C_CYAN, 1);
+  text_center(160, 40, sight ? "TAP WHEN A RED ARROW FILLS THE GREY ONE" : "LISTEN, AND TAP SPACE ON EVERY CLICK", C_WHITE, 1);
+  rect_a(144, 52, 32, 88, 0x101028, 255);
+  // In the sound step nothing moves: the eyes must not lead the ears.
+  int v = Cal.flash > 0 ? 255 : sight ? 110 : 80;
+  draw_arrow(160, 64, 14, 2, (Uint32)(v << 16 | v << 8 | v), 255);
+  if (sight) {
+    SDL_Rect clip = { 144, 52, 32, 88 };
+    SDL_SetRenderClipRect(ren, &clip);
+    for (int k = 0; k < 3; k++) draw_arrow(160, 64 + (float)((k + 1 - phase) * CAL_BEAT) * 90, 14, 2, 0xF83800, 255);
+    SDL_SetRenderClipRect(ren, NULL);
+  }
   if (Cal.n || Cal.flash > 0) {
     int ms = (int)lroundf(Cal.last * 1000);
-    SDL_snprintf(buf, sizeof(buf), "LAST TAP: %d MS %s", abs(ms), ms >= 0 ? "AFTER THE BEAT" : "BEFORE THE BEAT");
-    text_center(160, 150, buf, C_GREY, 1);
+    SDL_snprintf(buf, sizeof(buf), "LAST TAP: %d MS %s", abs(ms), ms >= 0 ? "LATE" : "EARLY");
+    text_center(160, 146, buf, C_GREY, 1);
   }
   if (n >= 4) {
-    SDL_snprintf(buf, sizeof(buf), "MEASURED DELAY: %+d MS", measured);
-    text_center(160, 163, buf, C_CYAN, 1);
+    SDL_snprintf(buf, sizeof(buf), "MEASURED %s: %+d MS", sight ? "SIGHT LEAD" : "SOUND DELAY", cal_result());
+    text_center(160, 158, buf, C_CYAN, 1);
     SDL_snprintf(buf, sizeof(buf), "%d TAPS, STEADY TO WITHIN %d MS", n, (int)lroundf(cal_spread() * 1000));
-    text_center(160, 174, buf, cal_spread() < 0.03f ? C_ZOMBIE : C_SKIN, 1);
-  } else text_center(160, 163, "KEEP TAPPING...", C_CYAN, 1);
-  SDL_snprintf(buf, sizeof(buf), "SAVED DELAY: %+d MS", A.offset_ms);
-  text_center(160, 189, buf, C_WHITE, 1);
-  text_center(160, 204, n >= 8 ? "ENTER: SAVE THE MEASURED DELAY" : "ENTER SAVES AFTER 8 TAPS", n >= 8 ? C_YELLOW : C_DGREY, 1);
-  text_center(160, 216, "R: START OVER   - AND +: NUDGE SAVED BY 5", C_GREY, 1);
-  text_center(160, 228, "ESC: BACK TO THE TITLE", C_GREY, 1);
+    text_center(160, 169, buf, cal_spread() < 0.03f ? C_ZOMBIE : C_SKIN, 1);
+  } else text_center(160, 158, "KEEP TAPPING...", C_CYAN, 1);
+  SDL_snprintf(buf, sizeof(buf), "SAVED: SOUND %+d MS   SIGHT %+d MS", A.offset_ms, A.visual_ms);
+  text_center(160, 183, buf, C_WHITE, 1);
+  text_center(160, 196, n >= 8 ? (sight ? "ENTER: SAVE THE SIGHT LEAD" : "ENTER: SAVE, THEN GO TO STEP 2") : "ENTER SAVES AFTER 8 TAPS",
+              n >= 8 ? C_YELLOW : C_DGREY, 1);
+  text_center(160, 207, "TAB: OTHER STEP   R: START OVER   - +: NUDGE BY 2", C_GREY, 1);
+  SDL_snprintf(buf, sizeof(buf), "A: AUTOSYNC AFTER BOSS BATTLES IS %s", autosync ? "ON" : "OFF");
+  text_center(160, 218, buf, autosync ? C_ZOMBIE : C_GREY, 1);
+  text_center(160, 229, "ESC: BACK TO THE TITLE", C_GREY, 1);
 }
 
 static void draw_boss(void) {
-  double t = audio_song_time();
+  // Drawn slightly ahead of the sound clock, by the measured display delay.
+  double t = audio_song_time() + A.visual_ms / 1000.0;
   double beat = t / (DANCE_STEP_SEC * 2);
   float bob = (beat - floor(beat)) < 0.5 ? -2.0f : 0.0f;
   const Boss *B = &bosses[G.boss_kind];
@@ -1099,7 +1218,8 @@ static void draw_title(void) {
     text(40, y, buf, on ? C_YELLOW : C_GREY, 1);
     text(112, y, ranks[i].blurb, on ? C_WHITE : C_DGREY, 1);
   }
-  text_center(160, 200, "UP / DOWN OR 1-8: CHOOSE YOUR RANK", C_GREY, 1);
+  if (G.msg_t > 0) text_center(160, 200, G.msg, G.msg_color, 1);
+  else text_center(160, 200, "UP / DOWN OR 1-8: CHOOSE YOUR RANK   F7: LOAD", C_GREY, 1);
   if ((int)(G.time * 2) & 1) text_center(160, 214, "PRESS ENTER TO START", C_WHITE, 1);
 #ifndef __EMSCRIPTEN__
   text_center(160, 228, "F2: CALIBRATE THE BEAT   F11: FULLSCREEN", C_DGREY, 1);
@@ -1139,7 +1259,7 @@ static void update_status(void) {
   char buf[96];
   const Rank *R = &ranks[G.rank];
   if (G.state == ST_TITLE) SDL_snprintf(buf, sizeof(buf), "Home Row Horde. Press Enter to start.");
-  else if (G.state == ST_CALIBRATE) SDL_snprintf(buf, sizeof(buf), "Beat calibration. Tap space on every beat. Saved delay %d ms.", A.offset_ms);
+  else if (G.state == ST_CALIBRATE) SDL_snprintf(buf, sizeof(buf), "Beat calibration, %s step. Tap space on every beat. Sound %d ms, sight %d ms.", Cal.mode == CAL_SIGHT ? "sight" : "sound", A.offset_ms, A.visual_ms);
   else if (G.state == ST_PLAY && G.paused) SDL_snprintf(buf, sizeof(buf), "Paused. Press Enter to keep playing.");
   else if (G.state == ST_GAMEOVER) SDL_snprintf(buf, sizeof(buf), "The wall has fallen. Press Enter to try again.");
   else if (G.state == ST_VICTORY) SDL_snprintf(buf, sizeof(buf), "Dawn breaks. You win! Score %d.", G.score);
@@ -1167,6 +1287,8 @@ static void draw(void) {
       text_center(160, 70, "PAUSED", C_YELLOW, 4);
       text_center(160, 124, "ENTER OR ESC: KEEP PLAYING", C_WHITE, 1);
       text_center(160, 138, "Q: QUIT TO THE TITLE", C_GREY, 1);
+      text_center(160, 152, "F6: SAVE THE GAME   F7: LOAD IT", C_GREY, 1);
+      if (G.msg_t > 0) text_center(160, 100, G.msg, G.msg_color, 1);
       char buf[48];
       SDL_snprintf(buf, sizeof(buf), "< > BEAT TIMING: %+d MS", A.offset_ms);
       text_center(160, 166, buf, C_CYAN, 1);
@@ -1196,17 +1318,28 @@ static void draw(void) {
 // ---- input ---------------------------------------------------------------------------
 static void key_down(SDL_Keycode key) {
   bool enter = key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE;
+  if (key == SDLK_F6) { save_game(); return; }
+  if (key == SDLK_F7) { load_game(); return; }
   switch (G.state) {
-    case ST_CALIBRATE:
+    case ST_CALIBRATE: {
+      bool sight = Cal.mode == CAL_SIGHT;
+      int step = key == SDLK_MINUS || key == SDLK_KP_MINUS ? -2 : key == SDLK_EQUALS || key == SDLK_PLUS || key == SDLK_KP_PLUS ? 2 : 0;
       if (key == SDLK_ESCAPE) go_title();
-      else if (key == SDLK_R) { int keep = G.sel; calibrate_start(); G.sel = keep; }
+      else if (key == SDLK_R) calibrate_mode(Cal.mode);
+      else if (key == SDLK_TAB) calibrate_mode(sight ? CAL_SOUND : CAL_SIGHT);
+      else if (key == SDLK_A) { autosync = !autosync; settings_save(); }
       else if (key == SDLK_RETURN || key == SDLK_KP_ENTER) {
-        if (cal_count() >= 8) { offset_set((int)lroundf(cal_mean() * 1000)); sfx(WAVE_SQUARE, 1320, 0, 0.12f, 0.1f, 0); Cal.n = 0; }
+        if (cal_count() >= 8) {
+          sfx(WAVE_SQUARE, 1320, 0, 0.12f, 0.1f, 0);
+          if (sight) { visual_set(cal_result()); calibrate_mode(CAL_SIGHT); }   // stay, so the result can be checked
+          else { offset_set(cal_result()); calibrate_mode(CAL_SIGHT); }
+        }
       }
-      else if (key == SDLK_MINUS || key == SDLK_KP_MINUS) offset_change(-5);
-      else if (key == SDLK_EQUALS || key == SDLK_PLUS || key == SDLK_KP_PLUS) offset_change(5);
+      else if (step && sight) visual_set(A.visual_ms + step);
+      else if (step) offset_change(step);
       else if (key == SDLK_SPACE || key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_UP || key == SDLK_DOWN) calibrate_tap();
       break;
+    }
     case ST_TITLE:
       if (key == SDLK_F2) { calibrate_start(); break; }
       if (key == SDLK_UP) { G.sel = (G.sel + NRANKS - 1) % NRANKS; sfx(WAVE_SQUARE, 660, 0, 0.04f, 0.08f, 0); }
@@ -1282,12 +1415,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   build_background();
 
   audio_init(T.on);
-  offset_load();
+  settings_load();
   go_title();
 #ifndef __EMSCRIPTEN__
   if (getenv("HRH_RANK")) new_game(atoi(getenv("HRH_RANK")) - 1);
   if (getenv("HRH_CALIB")) {   // show the calibration screen with some sample taps
     calibrate_start();
+    if (atoi(getenv("HRH_CALIB")) == 2) calibrate_mode(CAL_SIGHT);
     for (Cal.n = 0; Cal.n < 10; Cal.n++) Cal.err[Cal.n] = 0.024f + 0.004f * (float)(Cal.n % 4);
     Cal.last = 0.031f;
   }
