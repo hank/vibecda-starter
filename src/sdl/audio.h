@@ -44,6 +44,7 @@ static struct {
   Sint64 generated;          // samples generated so far
   double clock;              // smoothed playback position, in seconds of samples
   double latency;            // estimated delay between that position and the speakers
+  int default_offset_ms;     // starting sound delay for this device, before any calibration
   int offset_ms;             // the player's own adjustment, from calibration or the pause screen
   int visual_ms;             // how far ahead arrows are drawn, to cancel the display's own delay
   bool song_muted;           // the song keeps time but is silent (sight calibration)
@@ -159,14 +160,25 @@ static void audio_init(bool fake) {
     SDL_AudioSpec spec = { SDL_AUDIO_F32, 1, SR };
     A.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (A.stream) {
-      // The device pulls audio a buffer at a time. On average the stream position
-      // runs half a buffer ahead of what is being mixed, and roughly one more
-      // buffer sits between the mixer and the speakers.
+      // The device pulls audio a buffer at a time, so on average the stream
+      // position runs half a buffer ahead of what the device has taken. That
+      // part is arithmetic and is always removed. Whatever delay remains
+      // (the sound server, the hardware) is the player's "sound delay".
       SDL_AudioSpec dev; int frames = 0;
-      A.latency = 0.05;
+      double buffer = 0.023;
       if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(A.stream), &dev, &frames) && frames > 0 && dev.freq > 0)
-        A.latency = 1.5 * frames / dev.freq + 0.01;
-      SDL_Log("Audio buffer %d frames, estimated latency %.0f ms", frames, A.latency * 1000);
+        buffer = (double)frames / dev.freq;
+      A.latency = buffer / 2;
+#ifdef __EMSCRIPTEN__
+      // Browsers buffer more and vary: start from one more buffer plus a little.
+      A.default_offset_ms = (int)(buffer * 1000 + 10.5);
+#else
+      // Taken from a StepMania 5.1 calibration on the development machine
+      // (PipeWire, 1024-frame quantum): GlobalOffsetSeconds=-0.039126, which is
+      // 39 ms of delay in total, less the 12 ms half buffer removed above.
+      A.default_offset_ms = 27;
+#endif
+      SDL_Log("Audio buffer %d frames, default sound delay %d ms", frames, A.default_offset_ms);
       SDL_ResumeAudioStreamDevice(A.stream);
     } else A.fake = true;
   }

@@ -474,15 +474,20 @@ static void boss_end(bool won) {
   }
 }
 
+static double hit_window(void);
 static void boss_judge(const char *label, Uint32 color) {
   SDL_strlcpy(G.judge, label, sizeof(G.judge)); G.judge_t = 0.5f; G.judge_color = color; G.judge_sub[0] = 0;
 }
+
+// Judgement windows are StepMania's defaults: 22.5, 45, 90 and 135 ms, with its
+// widest 180 ms window kept only for the beginner ranks.
+static double hit_window(void) { return G.rank < 3 ? 0.180 : 0.135; }
 
 static void boss_press(int col) {
   if (G.sub != SUB_BOSS) return;
   G.press_flash[col] = 0.12f;
   double t = audio_song_time_at(key_ts);
-  double good = G.rank < 3 ? 0.20 : 0.14;
+  double good = hit_window();
   for (int i = 0; i < G.nnotes; i++) {
     Note *n = &G.notes[i];
     if (n->state || n->col != col) continue;
@@ -490,14 +495,14 @@ static void boss_press(int col) {
     if (d > good) continue;
     n->state = 1; G.hits++; G.combo++;
     G.sync_sum += (float)off; G.sync_sq += (float)(off * off); G.sync_n++;
-    int tier = d <= 0.045 ? 0 : d <= 0.09 ? 1 : 2;
-    static const char *const names[3] = { "PERFECT", "GREAT", "GOOD" };
-    static const Uint32 colors[3] = { C_YELLOW, C_ZOMBIE, C_CYAN };
-    G.score += 60 - tier * 20;
+    int tier = d <= 0.0225 ? 0 : d <= 0.045 ? 1 : d <= 0.090 ? 2 : d <= 0.135 ? 3 : 4;
+    static const char *const names[5] = { "FANTASTIC", "PERFECT", "GREAT", "GOOD", "OK" };
+    static const Uint32 colors[5] = { C_WHITE, C_YELLOW, C_ZOMBIE, C_CYAN, C_PURPLE };
+    G.score += 60 - tier * 10;
     boss_judge(names[tier], colors[tier]);
     if (tier) SDL_snprintf(G.judge_sub, sizeof(G.judge_sub), "%s %d MS", off > 0 ? "LATE" : "EARLY", (int)(d * 1000));
     G.hit_flash[col] = 0.2f; G.hit_color[col] = colors[tier];
-    sfx(WAVE_SQUARE, 1320.0f - tier * 165.0f, 0, 0.05f, 0.07f, 0);
+    sfx(WAVE_SQUARE, 1320.0f - tier * 110.0f, 0, 0.05f, 0.07f, 0);
     if (G.boss_hp > 0) { G.boss_hp--; fire(G.boss_x, boss_cy(), -1, true); }
     return;
   }
@@ -508,7 +513,7 @@ static void boss_update(float dt) {
   if (G.boss_x > 274) { G.boss_x -= 40 * dt; if (G.boss_x < 274) G.boss_x = 274; }
   for (int i = 0; i < G.nnotes; i++) {
     Note *n = &G.notes[i];
-    if (n->state == 0 && t > note_time(n) + (G.rank < 3 ? 0.20 : 0.14)) {
+    if (n->state == 0 && t > note_time(n) + (hit_window())) {
       n->state = 2; G.misses++; G.combo = 0;
       boss_judge("MISS", C_RED);
       if (G.rank >= 3 && G.misses % 8 == 0) hurt_wall(1, false);
@@ -555,26 +560,29 @@ static void pref_file(const char *name, char *path, size_t n) {
 static int autosync;   // 1: nudge the sound delay after each boss battle, as StepMania's AutoSync does
 static void settings_save(void) {
 #ifdef __EMSCRIPTEN__
-  EM_ASM({ try { localStorage.setItem('hrh-sync', $0 + ',' + $1 + ',' + $2); } catch (e) {} }, A.offset_ms, A.visual_ms, autosync);
+  EM_ASM({ try { localStorage.setItem('hrh-sync2', $0 + ',' + $1 + ',' + $2); } catch (e) {} }, A.offset_ms, A.visual_ms, autosync);
 #else
   if (T.on) return;
-  char path[512]; pref_file("sync.txt", path, sizeof(path));
+  char path[512]; pref_file("sync2.txt", path, sizeof(path));
   FILE *f = fopen(path, "w");
   if (f) { fprintf(f, "%d %d %d\n", A.offset_ms, A.visual_ms, autosync); fclose(f); }
 #endif
 }
 static void settings_load(void) {
-  A.visual_ms = 20;   // about a frame of display delay until it is measured
+  // Defaults until the player calibrates: the device's starting sound delay, and
+  // no sight lead (StepMania's VisualDelaySeconds was 0 on the same machine).
+  A.offset_ms = A.default_offset_ms;
+  A.visual_ms = 0;
 #ifdef __EMSCRIPTEN__
-  int found = EM_ASM_INT({ try { return (localStorage.getItem('hrh-sync') || '').split(',').length == 3 ? 1 : 0; } catch (e) { return 0; } });
+  int found = EM_ASM_INT({ try { return (localStorage.getItem('hrh-sync2') || '').split(',').length == 3 ? 1 : 0; } catch (e) { return 0; } });
   if (found) {
-    A.offset_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[0], 10) || 0; } catch (e) { return 0; } });
-    A.visual_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[1], 10) || 0; } catch (e) { return 0; } });
-    autosync = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync').split(',')[2], 10) || 0; } catch (e) { return 0; } });
+    A.offset_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync2').split(',')[0], 10) || 0; } catch (e) { return 0; } });
+    A.visual_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync2').split(',')[1], 10) || 0; } catch (e) { return 0; } });
+    autosync = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-sync2').split(',')[2], 10) || 0; } catch (e) { return 0; } });
   }
 #else
   if (T.on) return;
-  char path[512]; pref_file("sync.txt", path, sizeof(path));
+  char path[512]; pref_file("sync2.txt", path, sizeof(path));
   FILE *f = fopen(path, "r");
   if (f) {
     int o, v, a;

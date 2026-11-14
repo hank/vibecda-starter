@@ -66,24 +66,26 @@ test('F2 opens two-step beat calibration, and the measured delay is saved', asyn
   await expect(status).toHaveText(TITLE);
   await page.locator('canvas').click();
   await page.keyboard.press('F2');
-  await expect(status).toHaveText('Beat calibration, sound step. Tap space on every beat. Sound 0 ms, sight 20 ms.');
+  // The starting sound delay depends on the browser's audio buffer; the sight lead starts at 0.
+  await expect(status).toHaveText(/^Beat calibration, sound step\. Tap space on every beat\. Sound \d+ ms, sight 0 ms\.$/);
+  const initial = Number((await status.textContent()).match(/Sound (\d+) ms/)[1]);
   await page.keyboard.press('Equal');
   await page.keyboard.press('Equal');
-  await expect(status).toContainText('Sound 4 ms');
+  await expect(status).toContainText(`Sound ${initial + 4} ms`);
   // Tap steadily for a while (half a second apart, like the click), then save what was measured.
   await page.waitForTimeout(1200);
   for (let i = 0; i < 10; i++) { await page.keyboard.press('Space'); await page.waitForTimeout(500); }
   await page.keyboard.press('Enter');
   // Saving the sound delay moves on to the sight step.
   await expect(status).toContainText('sight step');
-  await expect(status).not.toContainText('Sound 4 ms');
+  await expect(status).not.toContainText(`Sound ${initial + 4} ms`);
   const saved = (await status.textContent()).match(/Sound (-?\d+) ms/)[1];
   await page.keyboard.press('Minus');
-  await expect(status).toContainText('sight 18 ms');
+  await expect(status).toContainText('sight -2 ms');
   await page.reload();
   await page.locator('canvas').click();
   await page.keyboard.press('F2');
-  await expect(status).toContainText(`Sound ${saved} ms, sight 18 ms.`);
+  await expect(status).toContainText(`Sound ${saved} ms, sight -2 ms.`);
   await page.keyboard.press('Escape');
   await expect(status).toHaveText(TITLE);
 });
