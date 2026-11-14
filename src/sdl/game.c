@@ -1,8 +1,8 @@
 // Home Row Horde: a typing defence game written in C on SDL3.
 // Zombies shamble out of the forest toward your compound; type what they carry
 // to shoot them. Ranks climb from single home-row letters to keeping a moving
-// average words-per-minute. Now and then the Pumpkin King arrives and the game
-// switches to a W A S D rhythm battle on the beat of the music.
+// average words-per-minute. Now and then a boss monster arrives and the game
+// switches to an arrow-key rhythm battle on the beat of the music.
 //
 // Native build:  npm run native     Web build (Emscripten):  npm run wasm
 #define SDL_MAIN_USE_CALLBACKS 1
@@ -29,8 +29,6 @@
 #define WPM_WINDOW 8.0f              // seconds in the moving average
 #define BOSS_MIN_GAP 25.0f           // minimum seconds of typing between boss battles
 #define BOSS_RANDOM_GAP 20.0f        // plus up to this many more, chosen at random
-#define AUDIO_LATENCY 0.05           // rough output delay, added when judging notes
-#define NOTE_SPEED 90.0f             // dance note fall speed, pixels per second
 #define RECEPTOR_Y 170
 
 typedef struct {
@@ -94,6 +92,7 @@ typedef struct { int step, col, state; } Note;   // state: 0 pending, 1 hit, 2 m
 
 static struct {
   int state, sub, rank, sel;
+  bool paused;
   int hp, kills, spawned, score, streak, correct, wrong, target, last_lane;
   float time, spawn_t, tclock, rank_clock, ward, fear_t, shake, wall_flash, state_t;
   float archer_y, shoot_t;
@@ -108,12 +107,44 @@ static struct {
   Note notes[DANCE_STEPS]; int nnotes, boss_hp, boss_max, hits, misses, combo;
   float boss_x, boss_flash, press_flash[4], out_t;
   bool boss_won;
+  int boss_kind;
   char judge[12]; float judge_t; Uint32 judge_color;
 } G;
 
 static SDL_Window *win;
 static SDL_Texture *screen_tex, *bg_tex;
-static Spr s_zombie[3][2], s_bat[2], s_brute, s_archer, s_bolt, s_tomb, s_heart, s_note;
+static Spr s_zombie[3][2], s_bat[2], s_brute, s_lich, s_archer, s_bolt[4], s_tomb, s_heart, s_note;
+
+// The archer's weapon improves every two ranks. Better weapons fly faster and
+// their impact knocks back other monsters near the one that was hit.
+typedef struct { const char *name; float speed; int splash, push; Uint32 trail; } Weapon;
+static const Weapon weapons[] = {
+  { "OAK ARROWS",    520,  0,  0, 0 },
+  { "FIRE ARROWS",   560, 36, 10, C_SKIN },
+  { "SILVER BOLTS",  800, 44, 14, C_WHITE },
+  { "STORM STAFF",  1400, 60, 18, C_CYAN },
+};
+#define WEAPON_OF(rank) ((rank) / 2)
+
+// Boss monsters for the W A S D battles. Each one plays a little differently.
+typedef struct {
+  const char *name, *hint;
+  Spr *frames[2];
+  int scale;
+  bool hover;
+  float note_speed;   // pixels per second
+  int need_pct;       // share of the notes that must be hit to win
+  int reveal_y;       // notes stay hidden above this line
+  Uint32 color;
+} Boss;
+static const Boss bosses[] = {
+  { "PUMPKIN KING", "HIT THE ARROWS ON THE BEAT", { &s_brute, &s_brute },               2, false,  90, 60, 32, C_SKIN },
+  { "BAT QUEEN",    "HER ARROWS FLY FAST",        { &s_bat[0], &s_bat[1] },             3, true,  125, 55, 32, C_PURPLE },
+  { "ROTTEN GIANT", "TOUGH HIDE: MISS VERY FEW",  { &s_zombie[2][0], &s_zombie[2][1] }, 3, false,  80, 70, 32, C_ZOMBIE },
+  { "THE LICH",     "HIS ARROWS APPEAR LATE",     { &s_lich, &s_lich },                 2, false, 100, 60, 96, C_CYAN },
+};
+#define NBOSSES ((int)SDL_arraysize(bosses))
+static int last_boss = -1, force_boss = -1;
 static Uint64 last_ns;
 static Uint32 rng_state = 0xC0FFEE;
 
@@ -226,6 +257,33 @@ static void hurt_wall(int dmg, bool lethal) {
   sfx(WAVE_TRI, 90, -120, 0.25f, 0.5f, 0);
 }
 
+static float boss_cy(void) {   // vertical centre of the current boss
+  const Boss *b = &bosses[G.boss_kind];
+  if (b->hover) return 140 + sinf(G.time * 3) * 6;
+  return 190 - b->frames[0]->h * b->scale / 2.0f;
+}
+
+static void spark(float x, float y, Uint32 color) {
+  for (int i = 0; i < (int)SDL_arraysize(G.parts); i++)
+    if (G.parts[i].life <= 0) {
+      G.parts[i] = (Particle){ x, y, (rndf() - 0.5f) * 14, (rndf() - 0.5f) * 14 - 8, 0.15f + rndf() * 0.2f, color };
+      return;
+    }
+}
+
+// Upgraded weapons stagger the monsters around the one they hit.
+static void splash(const Enemy *hit) {
+  const Weapon *w = &weapons[WEAPON_OF(G.rank)];
+  if (!w->splash) return;
+  for (int i = 0; i < MAX_EN; i++) {
+    Enemy *o = &G.en[i];
+    if (!o->alive || o->doomed || o == hit || o->rise < 1) continue;
+    if (SDL_fabsf(o->x - hit->x) > w->splash || abs(o->lane - hit->lane) > 1) continue;
+    o->x = SDL_min(o->x + w->push, 300.0f);
+    puff(o->x, enemy_y(o), w->trail, 2);
+  }
+}
+
 static void fire(float tx, float ty, int target, bool at_boss) {
   (void)tx;
   for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++)
@@ -285,7 +343,7 @@ static void type_char(char c) {
 }
 
 // ---- boss battle (the W A S D rhythm mode) ----------------------------------------
-static const char boss_keys[4] = { 'A', 'S', 'W', 'D' };         // left, down, up, right
+// Columns run left, down, up, right: the arrow keys (W A S D also works).
 static const double boss_angles[4] = { -90, 180, 0, 90 };
 static const Uint32 boss_colors[4] = { C_PINK, C_CYAN, C_ZOMBIE, C_YELLOW };
 
@@ -321,7 +379,10 @@ static double note_time(const Note *n) { return (DANCE_COUNT_IN + n->step) * DAN
 static void boss_start(void) {
   G.sub = SUB_BOSS; G.target = -1;
   boss_build_chart(ranks[G.rank].chart);
-  G.boss_max = G.boss_hp = (G.nnotes * 3 + 4) / 5;   // beaten by hitting 60% of the notes
+  do G.boss_kind = rndi(NBOSSES); while (G.boss_kind == last_boss);
+  if (force_boss >= 0) G.boss_kind = force_boss % NBOSSES;
+  last_boss = G.boss_kind;
+  G.boss_max = G.boss_hp = (G.nnotes * bosses[G.boss_kind].need_pct + 99) / 100;
   G.hits = G.misses = G.combo = 0; G.boss_x = 350; G.boss_won = false; G.judge_t = 0;
   audio_song(SONG_DANCE);
   sfx(WAVE_SQUARE, 110, 0, 0.5f, 0.12f, 0);
@@ -333,7 +394,7 @@ static void boss_end(bool won) {
   audio_song(SONG_TYPING);
   if (won) {
     G.score += 500;
-    puff(G.boss_x, 150, C_SKIN, 30); puff(G.boss_x, 130, C_YELLOW, 20);
+    puff(G.boss_x, boss_cy(), bosses[G.boss_kind].color, 30); puff(G.boss_x, boss_cy() - 20, C_YELLOW, 20);
     for (int i = 0; i < MAX_EN; i++) if (G.en[i].alive && !G.en[i].doomed) kill_enemy(&G.en[i]);
     G.hp = G.hp + 2 > MAX_HP ? MAX_HP : G.hp + 2;
     for (int i = 0; i < 4; i++) sfx(WAVE_SQUARE, midi_hz(69 + i * 4 + (i == 3 ? 0 : 0)), 0, 0.12f, 0.12f, i * 0.1f);
@@ -351,7 +412,7 @@ static void boss_judge(const char *label, Uint32 color) {
 static void boss_press(int col) {
   if (G.sub != SUB_BOSS) return;
   G.press_flash[col] = 0.12f;
-  double t = audio_song_time() - AUDIO_LATENCY;
+  double t = audio_song_time();
   double good = G.rank < 3 ? 0.20 : 0.14;
   for (int i = 0; i < G.nnotes; i++) {
     Note *n = &G.notes[i];
@@ -363,13 +424,13 @@ static void boss_press(int col) {
     G.score += perfect ? 60 : 30;
     boss_judge(perfect ? "PERFECT" : "GOOD", perfect ? C_YELLOW : C_ZOMBIE);
     sfx(WAVE_SQUARE, perfect ? 1320 : 990, 0, 0.05f, 0.07f, 0);
-    if (G.boss_hp > 0) { G.boss_hp--; fire(G.boss_x, 150, -1, true); }
+    if (G.boss_hp > 0) { G.boss_hp--; fire(G.boss_x, boss_cy(), -1, true); }
     return;
   }
 }
 
 static void boss_update(float dt) {
-  double t = audio_song_time() - AUDIO_LATENCY;
+  double t = audio_song_time();
   if (G.boss_x > 274) { G.boss_x -= 40 * dt; if (G.boss_x < 274) G.boss_x = 274; }
   for (int i = 0; i < G.nnotes; i++) {
     Note *n = &G.notes[i];
@@ -402,8 +463,30 @@ static void start_rank(int r) {
 
 static void new_game(int r) { G.score = 0; G.boss_timer = 0; start_rank(r); }
 
+// Pausing stops the audio device too, so the song clock that judges boss notes
+// freezes with the game and picks up exactly where it left off.
+static void set_paused(bool paused) {
+  G.paused = paused;
+  if (A.stream) { if (paused) SDL_PauseAudioStreamDevice(A.stream); else SDL_ResumeAudioStreamDevice(A.stream); }
+}
+
+// The beat-timing adjustment is remembered between visits on the web.
+static void offset_change(int delta) {
+  A.offset_ms = SDL_clamp(A.offset_ms + delta, -250, 250);
+#ifdef __EMSCRIPTEN__
+  EM_ASM({ try { localStorage.setItem('hrh-beat-offset', String($0)); } catch (e) {} }, A.offset_ms);
+#endif
+}
+static void offset_load(void) {
+#ifdef __EMSCRIPTEN__
+  A.offset_ms = EM_ASM_INT({ try { return parseInt(localStorage.getItem('hrh-beat-offset') || '0', 10) || 0; } catch (e) { return 0; } });
+  A.offset_ms = SDL_clamp(A.offset_ms, -250, 250);
+#endif
+}
+
 static void go_title(void) {
   int sel = G.sel;
+  set_paused(false);
   SDL_memset(&G, 0, sizeof(G));
   G.state = ST_TITLE; G.sel = sel; G.target = -1;
   audio_song(SONG_TYPING);
@@ -491,15 +574,18 @@ static void update(float dt) {
     Bolt *b = &G.bolts[i];
     if (!b->on) continue;
     float tx, ty;
-    if (b->at_boss) { tx = G.boss_x; ty = 150; }
+    if (b->at_boss) { tx = G.boss_x; ty = boss_cy(); }
     else if (b->target >= 0 && G.en[b->target].alive) { tx = G.en[b->target].x; ty = enemy_y(&G.en[b->target]); }
     else { b->on = false; continue; }
-    float dx = tx - b->x, dy = ty - b->y, d = sqrtf(dx * dx + dy * dy), stepd = 520 * dt;
+    float dx = tx - b->x, dy = ty - b->y, d = sqrtf(dx * dx + dy * dy), stepd = weapons[WEAPON_OF(G.rank)].speed * dt;
     if (d <= stepd + 4) {
       b->on = false;
       if (b->at_boss) { G.boss_flash = 0.1f; puff(tx - 8, ty, C_YELLOW, 3); }
-      else kill_enemy(&G.en[b->target]);
-    } else { b->x += dx / d * stepd; b->y += dy / d * stepd; }
+      else { kill_enemy(&G.en[b->target]); splash(&G.en[b->target]); }
+    } else {
+      b->x += dx / d * stepd; b->y += dy / d * stepd;
+      if (weapons[WEAPON_OF(G.rank)].trail) spark(b->x - 4, b->y, weapons[WEAPON_OF(G.rank)].trail);
+    }
   }
   for (int i = 0; i < MAX_EN; i++) {
     Enemy *e = &G.en[i];
@@ -671,23 +757,29 @@ static void draw_typing_hud(void) {
 }
 
 static void draw_boss(void) {
-  double t = audio_song_time() - AUDIO_LATENCY;
+  double t = audio_song_time();
   double beat = t / (DANCE_STEP_SEC * 2);
   float bob = (beat - floor(beat)) < 0.5 ? -2.0f : 0.0f;
-  // the Pumpkin King: the brute drawn double size
+  const Boss *B = &bosses[G.boss_kind];
+  Spr body = *B->frames[(int)(beat * 2) & 1];
+  float bw = (float)(body.w * B->scale), bh = (float)(body.h * B->scale);
+  float top = boss_cy() - bh / 2 + (B->hover ? 0 : bob);
   if (!(G.boss_flash > 0 && ((int)(G.time * 40) & 1))) {
-    SDL_FRect d = { SDL_floorf(G.boss_x - s_brute.w), 190 - s_brute.h * 2.0f + bob, s_brute.w * 2.0f, s_brute.h * 2.0f };
-    SDL_RenderTexture(ren, s_brute.t, NULL, &d);
-    rect(G.boss_x - 10, d.y - 8, 20, 2, C_YELLOW);   // crown
-    for (int i = 0; i < 3; i++) rect(G.boss_x - 10 + i * 8, d.y - 12, 4, 4, C_YELLOW);
+    SDL_FRect d = { SDL_floorf(G.boss_x - bw / 2), SDL_floorf(top), bw, bh };
+    SDL_RenderTexture(ren, body.t, NULL, &d);
+    if (G.boss_kind == 0) {   // the king's crown
+      rect(G.boss_x - 10, top - 8, 20, 2, C_YELLOW);
+      for (int i = 0; i < 3; i++) rect(G.boss_x - 10 + i * 8, top - 12, 4, 4, C_YELLOW);
+    }
   }
-  rect(G.boss_x - 26, 112, 52, 6, C_DGREY); rect(G.boss_x - 25, 113, 50, 4, C_BLACK);
-  rect(G.boss_x - 25, 113, 50.0f * G.boss_hp / (float)(G.boss_max ? G.boss_max : 1), 4, C_RED);
+  float bar = SDL_min(top - 22, 150.0f);
+  rect(G.boss_x - 26, bar, 52, 6, C_DGREY); rect(G.boss_x - 25, bar + 1, 50, 4, C_BLACK);
+  rect(G.boss_x - 25, bar + 1, 50.0f * G.boss_hp / (float)(G.boss_max ? G.boss_max : 1), 4, C_RED);
 
   // note highway
   rect_a(90, 18, 140, 178, C_BLACK, 190);
   frame(90, 18, 140, 178, C_DPURP);
-  text_center(160, 22, "PUMPKIN KING!", C_SKIN, 1);
+  text_center(160, 22, B->name, B->color, 1);
   for (int c = 0; c < 4; c++) {
     float cx = 112.0f + 32.0f * c;
     rect_a(cx - 15, 32, 30, 152, 0x101028, 255);
@@ -695,15 +787,13 @@ static void draw_boss(void) {
     bool lit = G.press_flash[c] > 0;
     SDL_SetTextureColorMod(s_note.t, lit ? 255 : 110, lit ? 255 : 110, lit ? 255 : 110);
     SDL_RenderTextureRotated(ren, s_note.t, NULL, &d, boss_angles[c], NULL, SDL_FLIP_NONE);
-    char k[2] = { boss_keys[c], 0 };
-    text(cx - 5, 182, k, boss_colors[c], 2);
   }
-  SDL_Rect clip = { 90, 32, 140, 148 };
+  SDL_Rect clip = { 90, B->reveal_y, 140, 180 - B->reveal_y };
   SDL_SetRenderClipRect(ren, &clip);
   for (int i = 0; i < G.nnotes; i++) {
     const Note *n = &G.notes[i];
     if (n->state == 1) continue;
-    float y = RECEPTOR_Y - (float)(note_time(n) - t) * NOTE_SPEED;
+    float y = RECEPTOR_Y - (float)(note_time(n) - t) * B->note_speed;
     if (y < 20 || y > 200) continue;
     SDL_FRect d = { 112.0f + 32.0f * n->col - 7, SDL_floorf(y) - 7, 14, 14 };
     Uint32 col = n->state == 2 ? 0x505050 : boss_colors[n->col];
@@ -717,8 +807,8 @@ static void draw_boss(void) {
   if (t < count_in) {
     text_center(160, 60, "BOSS BATTLE!", C_RED, 2);
     text_center(160, 84, "MOVE YOUR HAND TO", C_WHITE, 1);
-    text_center(160, 98, "W A S D", C_YELLOW, 3);
-    text_center(160, 126, "HIT THE ARROWS ON THE BEAT", C_GREY, 1);
+    text_center(160, 100, "ARROW KEYS", C_YELLOW, 2);
+    text_center(160, 126, B->hint, C_GREY, 1);
     int left = (int)ceil((count_in - t) / (DANCE_STEP_SEC * 2));
     if (left <= 3 && left >= 1) { char s[2] = { (char)('0' + left), 0 }; text_center(160, 140, s, C_WHITE, 3); }
   } else if (G.judge_t > 0) {
@@ -732,7 +822,7 @@ static void draw_play(void) {
   char buf[64];
   bool boss = G.sub == SUB_BOSS;
   float bob = 0;
-  if (boss) { double b = (audio_song_time() - AUDIO_LATENCY) / (DANCE_STEP_SEC * 2); bob = (b - floor(b)) < 0.5 ? -2.0f : 0.0f; }
+  if (boss) { double b = (audio_song_time()) / (DANCE_STEP_SEC * 2); bob = (b - floor(b)) < 0.5 ? -2.0f : 0.0f; }
 
   SDL_RenderTexture(ren, bg_tex, NULL, NULL);
   spr(s_archer, 20 + (G.shoot_t > 0 ? -1.0f : 0.0f), G.archer_y - s_archer.h);
@@ -742,7 +832,7 @@ static void draw_play(void) {
       if (G.en[i].alive && G.en[i].lane == l) draw_enemy(&G.en[i], bob);
   if (boss) draw_boss();
   for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++)
-    if (G.bolts[i].on) spr(s_bolt, G.bolts[i].x - 5, G.bolts[i].y - 1);
+    if (G.bolts[i].on) spr(s_bolt[WEAPON_OF(G.rank)], G.bolts[i].x - 5, G.bolts[i].y - 1);
   for (int i = 0; i < (int)SDL_arraysize(G.parts); i++)
     if (G.parts[i].life > 0) rect(G.parts[i].x, G.parts[i].y, 2, 2, G.parts[i].color);
   if (!boss)
@@ -768,9 +858,10 @@ static void draw_play(void) {
   if (boss) {
     SDL_snprintf(buf, sizeof(buf), "HITS %d  MISSES %d", G.hits, G.misses);
     text_center(160, 206, buf, C_WHITE, 1);
-    text_center(160, 220, "A = LEFT  S = DOWN  W = UP  D = RIGHT", C_GREY, 1);
+    text_center(160, 220, "USE THE ARROW KEYS, ON THE BEAT", C_GREY, 1);
   } else if (G.sub == SUB_BOSS_OUT) {
-    text_center(160, 204, G.boss_won ? "THE PUMPKIN KING IS BEATEN!" : "THE KING SMASHED THE WALL!", G.boss_won ? C_YELLOW : C_RED, 1);
+    SDL_snprintf(buf, sizeof(buf), G.boss_won ? "%s IS BEATEN!" : "%s SMASHED THE WALL!", bosses[G.boss_kind].name);
+    text_center(160, 204, buf, G.boss_won ? C_YELLOW : C_RED, 1);
     text_center(160, 216, "FINGERS BACK ON F AND J", C_WHITE, 1);
     char s[2] = { (char)('0' + (int)ceilf(G.out_t)), 0 };
     text_center(160, 227, s, C_CYAN, 1);
@@ -798,7 +889,10 @@ static void draw_title(void) {
     text(112, y, ranks[i].blurb, on ? C_WHITE : C_DGREY, 1);
   }
   text_center(160, 200, "UP / DOWN OR 1-8: CHOOSE YOUR RANK", C_GREY, 1);
-  if ((int)(G.time * 2) & 1) text_center(160, 216, "PRESS ENTER TO START", C_WHITE, 1);
+  if ((int)(G.time * 2) & 1) text_center(160, 214, "PRESS ENTER TO START", C_WHITE, 1);
+#ifndef __EMSCRIPTEN__
+  text_center(160, 228, "F11: FULLSCREEN", C_DGREY, 1);
+#endif
 }
 
 static void draw_banner(void) {
@@ -820,6 +914,10 @@ static void draw_banner(void) {
     SDL_snprintf(buf, sizeof(buf), "YOU ARE NOW A %s", ranks[G.rank + 1].name);
     text_center(160, 90, buf, C_WHITE, 1);
     text_center(160, 102, ranks[G.rank + 1].blurb, C_CYAN, 1);
+    if (WEAPON_OF(G.rank + 1) != WEAPON_OF(G.rank)) {
+      SDL_snprintf(buf, sizeof(buf), "NEW WEAPON: %s", weapons[WEAPON_OF(G.rank + 1)].name);
+      text_center(160, 113, buf, C_YELLOW, 1);
+    }
     text_center(160, 164, "ENTER: NEXT NIGHT", C_WHITE, 1);
   }
   SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
@@ -832,10 +930,11 @@ static void update_status(void) {
   char buf[96];
   const Rank *R = &ranks[G.rank];
   if (G.state == ST_TITLE) SDL_snprintf(buf, sizeof(buf), "Home Row Horde. Press Enter to start.");
+  else if (G.state == ST_PLAY && G.paused) SDL_snprintf(buf, sizeof(buf), "Paused. Press Enter to keep playing.");
   else if (G.state == ST_GAMEOVER) SDL_snprintf(buf, sizeof(buf), "The wall has fallen. Press Enter to try again.");
   else if (G.state == ST_VICTORY) SDL_snprintf(buf, sizeof(buf), "Dawn breaks. You win! Score %d.", G.score);
   else if (G.state == ST_RANKUP) SDL_snprintf(buf, sizeof(buf), "Rank up! Press Enter for rank %d.", G.rank + 2);
-  else if (G.sub == SUB_BOSS) SDL_snprintf(buf, sizeof(buf), "Boss battle: hit W A S D on the beat.");
+  else if (G.sub == SUB_BOSS) SDL_snprintf(buf, sizeof(buf), "Boss battle: hit the arrow keys on the beat.");
   else {
     char c = G.sub == SUB_TYPING ? next_char() : 0;
     if (c) SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Type %c", G.rank + 1, R->name, G.kills, R->quota, c);
@@ -848,7 +947,21 @@ static void draw(void) {
   SDL_SetRenderTarget(ren, screen_tex);
   SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
   if (G.state == ST_TITLE) draw_title();
-  else { draw_play(); if (G.state != ST_PLAY) draw_banner(); }
+  else {
+    draw_play();
+    if (G.state != ST_PLAY) draw_banner();
+    else if (G.paused) {
+      overlay(170);
+      text_center(160, 70, "PAUSED", C_YELLOW, 4);
+      text_center(160, 124, "ENTER OR ESC: KEEP PLAYING", C_WHITE, 1);
+      text_center(160, 138, "Q: QUIT TO THE TITLE", C_GREY, 1);
+      char buf[48];
+      SDL_snprintf(buf, sizeof(buf), "< > BEAT TIMING: %+d MS", A.offset_ms);
+      text_center(160, 166, buf, C_CYAN, 1);
+      text_center(160, 180, "ARROWS LAND BEFORE THE BEAT? PRESS >", C_GREY, 1);
+      text_center(160, 191, "ARROWS LAND AFTER THE BEAT? PRESS <", C_GREY, 1);
+    }
+  }
 
   SDL_SetRenderTarget(ren, NULL);
   int ow, oh;
@@ -879,7 +992,14 @@ static void key_down(SDL_Keycode key) {
       else if (enter) new_game(G.sel);
       break;
     case ST_PLAY:
-      if (key == SDLK_ESCAPE) { go_title(); break; }
+      if (G.paused) {
+        if (enter || key == SDLK_ESCAPE) set_paused(false);
+        else if (key == SDLK_Q) go_title();
+        else if (key == SDLK_LEFT) offset_change(-10);
+        else if (key == SDLK_RIGHT) offset_change(10);
+        break;
+      }
+      if (key == SDLK_ESCAPE) { set_paused(true); break; }
       if (G.sub == SUB_BOSS) {
         if (key == SDLK_A || key == SDLK_LEFT) boss_press(0);
         else if (key == SDLK_S || key == SDLK_DOWN) boss_press(1);
@@ -928,15 +1048,22 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   s_zombie[1][0] = SPRITE(zombie_a, "PBpn"); s_zombie[1][1] = SPRITE(zombie_b, "PBpn");
   s_zombie[2][0] = SPRITE(zombie_a, "PRpr"); s_zombie[2][1] = SPRITE(zombie_b, "PRpr");
   s_bat[0] = SPRITE(bat_a, NULL); s_bat[1] = SPRITE(bat_b, NULL);
-  s_brute = SPRITE(brute, NULL); s_archer = SPRITE(archer, NULL); s_bolt = SPRITE(bolt, NULL);
+  s_brute = SPRITE(brute, NULL); s_archer = SPRITE(archer, NULL);
+  s_lich = SPRITE(lich, NULL);
+  s_bolt[0] = SPRITE(bolt, "RgYG");       // oak arrow, plain iron tip
+  s_bolt[1] = SPRITE(bolt, NULL);         // fire arrow
+  s_bolt[2] = SPRITE(bolt, "oGRWYW");     // silver bolt
+  s_bolt[3] = SPRITE(bolt, "oCRWYCWC");   // storm bolt
   s_tomb = SPRITE(tombstone, NULL); s_heart = SPRITE(heart, NULL); s_note = SPRITE(note_arrow, NULL);
   build_background();
 
   audio_init(T.on);
+  offset_load();
   go_title();
 #ifndef __EMSCRIPTEN__
   if (getenv("HRH_RANK")) new_game(atoi(getenv("HRH_RANK")) - 1);
-  if (getenv("HRH_BOSS") && G.state == ST_PLAY) G.boss_timer = 0.5f;
+  if (getenv("HRH_BOSS") && G.state == ST_PLAY) { G.boss_timer = 0.5f; force_boss = atoi(getenv("HRH_BOSS")) - 1; }
+  for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--fullscreen")) SDL_SetWindowFullscreen(win, true);
 #endif
   last_ns = SDL_GetTicksNS();
   return SDL_APP_CONTINUE;
@@ -945,7 +1072,17 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
   (void)appstate;
   if (event->type == SDL_EVENT_QUIT) return SDL_APP_SUCCESS;
+#ifndef __EMSCRIPTEN__
+  // F11 or Alt+Enter toggles fullscreen. On the web, the page's button does this.
+  if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat &&
+      (event->key.key == SDLK_F11 || (event->key.key == SDLK_RETURN && (event->key.mod & SDL_KMOD_ALT)))) {
+    SDL_SetWindowFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN));
+    return SDL_APP_CONTINUE;
+  }
+#endif
   if (event->type == SDL_EVENT_KEY_DOWN && !event->key.repeat) key_down(event->key.key);
+  // Clicking away or switching tabs pauses, so the horde never advances unseen.
+  if (event->type == SDL_EVENT_WINDOW_FOCUS_LOST && G.state == ST_PLAY && !G.paused && !T.on) set_paused(true);
   return SDL_APP_CONTINUE;
 }
 
@@ -957,8 +1094,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
   if (dt > 0.05f) dt = 0.05f;
   if (T.on) dt = 1.0f / 60.0f;
 
-  audio_pump(dt);
-  update(dt);
+  if (!G.paused) { audio_pump(dt); update(dt); }
   update_status();
   draw();
 

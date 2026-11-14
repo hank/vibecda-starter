@@ -42,6 +42,9 @@ static struct {
   SDL_AudioStream *stream;
   bool fake;                 // no device: advance the clock from frame time instead
   Sint64 generated;          // samples generated so far
+  double clock;              // smoothed playback position, in seconds of samples
+  double latency;            // estimated delay between that position and the speakers
+  int offset_ms;             // the player's own adjustment, set on the pause screen
   int song, step;
   Sint64 song_start;         // sample index where the current song began
   double step_len, step_pos; // in samples
@@ -145,8 +148,17 @@ static void audio_init(bool fake) {
   if (!fake) {
     SDL_AudioSpec spec = { SDL_AUDIO_F32, 1, SR };
     A.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-    if (A.stream) SDL_ResumeAudioStreamDevice(A.stream);
-    else A.fake = true;
+    if (A.stream) {
+      // The device pulls audio a buffer at a time. On average the stream position
+      // runs half a buffer ahead of what is being mixed, and roughly one more
+      // buffer sits between the mixer and the speakers.
+      SDL_AudioSpec dev; int frames = 0;
+      A.latency = 0.05;
+      if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(A.stream), &dev, &frames) && frames > 0 && dev.freq > 0)
+        A.latency = 1.5 * frames / dev.freq + 0.01;
+      SDL_Log("Audio buffer %d frames, estimated latency %.0f ms", frames, A.latency * 1000);
+      SDL_ResumeAudioStreamDevice(A.stream);
+    } else A.fake = true;
   }
 }
 
@@ -165,13 +177,18 @@ static void audio_pump(float dt) {
     SDL_PutAudioStreamData(A.stream, buf, sizeof(buf));
     A.generated += 512; queued += 512;
   }
+  // The raw position moves in buffer-sized jumps. Advance a steady clock with
+  // frame time and pull it gently toward the raw position so it cannot drift.
+  double raw = (double)(A.generated - SDL_GetAudioStreamQueued(A.stream) / (int)sizeof(float)) / SR;
+  A.clock += dt;
+  double err = raw - A.clock;
+  if (err > 0.15 || err < -0.15) A.clock = raw; else A.clock += err * 0.05;
 }
 
-// Seconds of the current song that have actually left the stream.
+// Seconds into the current song, as the player is hearing it right now.
 static double audio_song_time(void) {
-  Sint64 played = A.generated;
-  if (!A.fake) played -= SDL_GetAudioStreamQueued(A.stream) / (int)sizeof(float);
-  return (double)(played - A.song_start) / SR;
+  if (A.fake) return (double)(A.generated - A.song_start) / SR;
+  return A.clock - (double)A.song_start / SR - A.latency - A.offset_ms / 1000.0;
 }
 
 #endif

@@ -216,6 +216,40 @@ static const char *const tombstone[] = {
   "KllKlKKlKllK",
 };
 
+// The Lich: a robed skull, drawn double size as a boss.
+static const char *const lich[] = {
+  "......KKKKKKKK......",
+  ".....KppppppppK.....",
+  "....KppppppppppK....",
+  "...KppKKKKKKKKppK...",
+  "...KpKWWWWWWWWKpK...",
+  "...KpKWKKWWKKWKpK...",
+  "...KpKWKRWWRKWKpK...",
+  "...KpKWWWKKWWWKpK...",
+  "...KpKWWWWWWWWKpK...",
+  "...KppKWKWKWKWKpK...",
+  "...KpppKKKKKKKppK...",
+  "..KppppppppppppppK..",
+  ".KppPppppppppppPppK.",
+  "KppPPppppYYppppPPppK",
+  "KppKPppppYYppppPKppK",
+  "KppKPppppppppppPKppK",
+  "KWWKPppppppppppPKWWK",
+  "KWWKPppppppppppPKWWK",
+  ".KK.KPppppppppPK.KK.",
+  "....KPppppppppPK....",
+  "....KPppppppppPK....",
+  "...KPPppppppppPPK...",
+  "...KPppppppppppPK...",
+  "..KPPppppppppppPPK..",
+  "..KPppppppppppppPK..",
+  ".KPPppppppppppppPPK.",
+  ".KPppppppppppppppPK.",
+  "KPPppppppppppppppPPK",
+  "KPpPpPpPpPpPpPpPpPpK",
+  "KKKKKKKKKKKKKKKKKKKK",
+};
+
 static const char *const heart[] = {
   ".RR.RR.",
   "RRRRRRR",

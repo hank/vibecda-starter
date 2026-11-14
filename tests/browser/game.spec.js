@@ -30,7 +30,14 @@ test('production build loads, and typing the letters slays zombies', async ({ pa
   await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
   await page.keyboard.press('j');
   await expect(status).toContainText('Slain 2/12');
+  // Escape pauses; Enter resumes where play left off; Q from the pause screen quits.
   await page.keyboard.press('Escape');
+  await expect(status).toHaveText('Paused. Press Enter to keep playing.');
+  await page.keyboard.press('f');
+  await page.keyboard.press('Enter');
+  await expect(status).toContainText('Slain 2/12');
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('q');
   await expect(status).toHaveText(TITLE);
   expect(errors).toEqual([]);
   expect(failures).toEqual([]);

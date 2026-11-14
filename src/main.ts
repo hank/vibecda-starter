@@ -21,3 +21,9 @@ document.body.append(script);
 
 // Keys go to the game once it has focus; clicking anywhere on it is enough.
 canvas.addEventListener('pointerdown', () => canvas.focus());
+
+// Fullscreen shows only the game, scaled as large as the screen allows.
+document.querySelector('#fullscreen')!.addEventListener('click', () => {
+  document.querySelector('#game')!.requestFullscreen().catch(() => {});
+  canvas.focus();
+});

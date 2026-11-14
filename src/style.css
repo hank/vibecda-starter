@@ -74,6 +74,11 @@ h1 { font: 400 clamp(1.1rem, 4.5vw, 1.9rem)/1.6 var(--pixel-font); letter-spacin
 /* SDL draws at 960 x 720; the page scales that to fit and keeps the pixels crisp. */
 canvas { display: block; width: 100% !important; height: auto !important; aspect-ratio: 4 / 3; image-rendering: pixelated; outline: none; }
 #game:focus-within { border-color: var(--gold); }
+#game:fullscreen { display: flex; align-items: center; justify-content: center; border: 0; border-radius: 0; }
+#game:fullscreen canvas { width: min(100vw, 133.334vh) !important; }
+.toolbar { margin: .75rem 0 0; text-align: right; }
+button { font: .6rem/1.7 var(--pixel-font); padding: .7rem 1rem; border-radius: 8px; border: 3px solid var(--border); background: var(--panel); color: var(--cyan); cursor: pointer; }
+button:hover { border-color: var(--cyan-dim); background: var(--panel-2); }
 
 #instructions { color: var(--muted); font-size: .95rem; margin: 1rem 0 0; }
 kbd, code { font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace; font-size: .9em; color: var(--cyan); background: var(--bg-deep); padding: .15rem .4rem; border: 1px solid var(--border); border-radius: 4px; }
