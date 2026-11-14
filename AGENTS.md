@@ -13,6 +13,11 @@ the participant guides in docs/ are left as they were in the starter.
 - Headless checks of the native build: SDL_VIDEODRIVER=offscreen with
   HRH_FRAMES=n, HRH_RANK=1..8, HRH_BOT=keys-per-second, HRH_BOSS=1, and
   HRH_SHOT=file.bmp to save the last frame.
+- The game has three modes chosen on the title screen: typing, math (answers
+  typed as digits), and an Idaho driver's test (multiple choice). Driver's test
+  questions live in src/sdl/drivers.h and were written from the Idaho Driver's
+  Handbook; check any new or changed fact against the current handbook.
+  HRH_MODE=1..3 picks the mode in headless runs.
 - The browser tests read the status line above the canvas, which the game
   updates from C (set_status in src/sdl/game.c). Keep the two in step.
 

@@ -10,6 +10,14 @@ Home Row Horde draws its artwork and makes its music and sounds in code
 | Press Start 2P font on the web page (`src/assets/fonts/`) | The Press Start 2P Project Authors (cody@zone38.net) | <https://fonts.google.com/specimen/Press+Start+2P> | SIL Open Font License 1.1; full text in `public/licenses/press-start-2p-OFL.txt` |
 | Sprites, backgrounds, music, sound effects | Made for this game, as code | this repository | same as the repository |
 
+## Driver's test questions
+
+The questions in `src/sdl/drivers.h` were written for this game from facts in the
+Idaho Driver's Handbook (Idaho Transportation Department, July 2026 edition,
+<https://itd.idaho.gov>). They are practice questions, not the official knowledge
+test bank, which is not published. The handbook itself notes that it paraphrases
+Idaho statutes; study the handbook before taking the real test.
+
 ## AI usage
 
 The game's code, pixel art, music, and sound effects were written with Claude Code

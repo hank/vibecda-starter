@@ -18,6 +18,7 @@
 
 #include "gfx.h"
 #include "audio.h"
+#include "drivers.h"
 
 // ---- tuning ------------------------------------------------------------------
 #define LANES 4
@@ -40,7 +41,7 @@ typedef struct {
   int wpm;            // moving-average WPM to hold, 0 for none
   int chart;          // dance difficulty 0..3
 } Rank;
-static const Rank ranks[] = {
+static const Rank ranks_type[] = {
   { "SPROUT",  "F AND J, THEN HOME ROW", 12,  6, 4.0f, 2,  0, 0 },
   { "SCOUT",   "HOME ROW AND TOP ROW",   16,  8, 3.2f, 3,  0, 0 },
   { "SQUIRE",  "EVERY LETTER",           20, 10, 2.6f, 3,  0, 1 },
@@ -50,7 +51,29 @@ static const Rank ranks[] = {
   { "WARDEN",  "PHRASES. KEEP 25 WPM",        24, 11, 2.2f, 5, 25, 3 },
   { "LEGEND",  "LONG PHRASES. KEEP 40 WPM",   30, 11, 1.8f, 5, 40, 3 },
 };
-#define NRANKS ((int)SDL_arraysize(ranks))
+// Math mode: answer the sum a monster carries. Every answer is a whole number,
+// zero or more, so only the digit keys are ever needed.
+static const Rank ranks_math[] = {
+  { "COUNTER",   "ADD SMALL NUMBERS",          12, 6, 4.0f, 2, 0, 0 },
+  { "ADDER",     "ADD AND SUBTRACT TO 20",     14, 7, 3.6f, 3, 0, 0 },
+  { "DOUBLER",   "EASY TIMES TABLES",          16, 7, 3.4f, 3, 0, 1 },
+  { "DIVIDER",   "MULTIPLY AND DIVIDE",        16, 7, 3.4f, 3, 0, 1 },
+  { "JUGGLER",   "TWO-DIGIT SUMS, TWO STEPS",  16, 6, 3.8f, 3, 0, 2 },
+  { "ROOTER",    "SQUARES AND SQUARE ROOTS",   16, 6, 3.8f, 3, 0, 2 },
+  { "POWERHOUSE", "EXPONENTS AND CUBE ROOTS",  18, 6, 3.6f, 4, 0, 3 },
+  { "LOG LORD",  "LOGARITHMS",                 20, 6, 3.4f, 4, 0, 3 },
+};
+// Driver's test mode: multiple-choice questions, one at a time. The quota is the
+// number of questions; the wall's hearts are the misses allowed plus one, so
+// the full test fails on the seventh miss exactly as the real one does.
+static const Rank ranks_drive[] = {
+  { "QUICK QUIZ", "10 QUESTIONS, 2 MISSES ALLOWED", 10, 7, 0, 4, 0, 1 },
+  { "FULL TEST",  "40 QUESTIONS, 6 MISSES ALLOWED", 40, 7, 0, 4, 0, 1 },
+};
+enum { MODE_TYPE, MODE_MATH, MODE_DRIVE, NMODES };
+static const Rank *const mode_ranks[NMODES] = { ranks_type, ranks_math, ranks_drive };
+static const int mode_nranks[NMODES] = { (int)SDL_arraysize(ranks_type), (int)SDL_arraysize(ranks_math), (int)SDL_arraysize(ranks_drive) };
+static const char *const mode_names[NMODES] = { "TYPING", "MATH", "DRIVER'S TEST" };
 
 static const char *const words3[] = { "AX","ASH","BAT","BOO","BOG","CAT","COB","CRY","DIG","DIM","EEK","ELF",
   "EYE","FOG","FUR","GAS","HAG","HEX","IMP","JAW","JAR","KEY","LID","MUD","NET","OAK","OWL","PIT","RAT",
@@ -98,6 +121,7 @@ typedef struct {
   int hp, words;       // words still to type, and words in total
   float x, rise, anim, atk, dying, hurt;
   char word[28];
+  char q[24];          // math mode: the question shown; `word` is its answer
 } Enemy;
 typedef struct { bool on; float x, y; int target; bool at_boss, wound; } Bolt;
 typedef struct { float x, y, vx, vy, life; Uint32 color; } Particle;
@@ -107,7 +131,10 @@ static void offset_set(int ms);
 typedef struct { int step, col, state; } Note;   // state: 0 pending, 1 hit, 2 missed
 
 static struct {
-  int state, sub, rank, sel;
+  int state, sub, rank, sel, mode;
+  int hp_max;
+  // driver's test: the question order, the one being asked, and how its answers are shuffled
+  Uint8 q_order[64], q_perm[4]; int q_num, q_n, q_pick, q_right; bool q_active; float q_reveal;
   bool paused;
   int hp, kills, spawned, score, streak, correct, wrong, target, last_lane;
   int weapon, wstreak, miss_run;   // weapon level, clean keys since it changed, wrong keys in a row
@@ -132,6 +159,8 @@ static struct {
   int boss_kind;
   char judge[12]; float judge_t; Uint32 judge_color;
 } G;
+#define ranks (mode_ranks[G.mode])
+#define NRANKS (mode_nranks[G.mode])
 
 static SDL_Window *win;
 static SDL_Texture *screen_tex, *bg_tex;
@@ -240,8 +269,57 @@ static bool first_letter_used(char c) {
   return false;
 }
 
+// A math question whose answer is a non-negative whole number. Bats ask one
+// from the level below and brutes one from the level above.
+static void math_question(Enemy *e) {
+  int lvl = SDL_clamp(G.rank + (e->kind == K_BRUTE) - (e->kind == K_BAT), 0, 7);
+  for (int tries = 0; tries < 30; tries++) {
+    int a = 0, b = 0, c = 0, ans = 0, k = rndi(60);
+    char q[24] = "";
+    switch (lvl) {
+      case 0: a = 1 + rndi(5); b = 1 + rndi(4); if (G.spawned == 0) a = b = 1;   // the very first one is 1+1
+              ans = a + b; SDL_snprintf(q, sizeof(q), "%d+%d", a, b); break;
+      case 1: if (k % 2) { a = 2 + rndi(9); b = 2 + rndi(9); ans = a + b; SDL_snprintf(q, sizeof(q), "%d+%d", a, b); }
+              else { a = 5 + rndi(16); b = 1 + rndi(a - 1); ans = a - b; SDL_snprintf(q, sizeof(q), "%d-%d", a, b); }
+              break;
+      case 2: if (k % 3) { a = 2 + rndi(4); b = 1 + rndi(10); ans = a * b; SDL_snprintf(q, sizeof(q), "%d@%d", a, b); }
+              else { a = 10 + rndi(40); b = 1 + rndi(9); ans = a + b; SDL_snprintf(q, sizeof(q), "%d+%d", a, b); }
+              break;
+      case 3: if (k % 2) { a = 2 + rndi(11); b = 2 + rndi(11); ans = a * b; SDL_snprintf(q, sizeof(q), "%d@%d", a, b); }
+              else { b = 2 + rndi(11); ans = 2 + rndi(11); SDL_snprintf(q, sizeof(q), "%d#%d", b * ans, b); }
+              break;
+      case 4: if (k % 3 == 0) { a = 10 + rndi(90); b = 10 + rndi(90); ans = a + b; SDL_snprintf(q, sizeof(q), "%d+%d", a, b); }
+              else if (k % 3 == 1) { a = 20 + rndi(80); b = 10 + rndi(a - 10); ans = a - b; SDL_snprintf(q, sizeof(q), "%d-%d", a, b); }
+              else { a = 2 + rndi(8); b = 2 + rndi(8); c = 1 + rndi(9); ans = a * b + c; SDL_snprintf(q, sizeof(q), "%d@%d+%d", a, b, c); }
+              break;
+      case 5: if (k % 2) { a = 2 + rndi(14); ans = a * a; SDL_snprintf(q, sizeof(q), "%d^2", a); }
+              else { ans = 2 + rndi(14); SDL_snprintf(q, sizeof(q), "$%d", ans * ans); }
+              break;
+      case 6: if (k % 4 == 0) { b = 2 + rndi(9); ans = 1 << b; SDL_snprintf(q, sizeof(q), "2^%d", b); }
+              else if (k % 4 == 1) { a = 3 + rndi(3); b = 2 + rndi(3); ans = 1; for (c = 0; c < b; c++) ans *= a; SDL_snprintf(q, sizeof(q), "%d^%d", a, b); }
+              else if (k % 4 == 2) { b = 2 + rndi(5); ans = 1; for (c = 0; c < b; c++) ans *= 10; SDL_snprintf(q, sizeof(q), "10^%d", b); }
+              else { ans = 2 + rndi(9); SDL_snprintf(q, sizeof(q), "CBRT(%d)", ans * ans * ans); }
+              break;
+      default: {
+        static const int bases[] = { 2, 2, 10, 3, 4, 5 }, top[] = { 10, 10, 6, 5, 5, 4 };
+        int i = k % 6, v = 1;
+        ans = 1 + rndi(top[i]);
+        for (c = 0; c < ans; c++) v *= bases[i];
+        SDL_snprintf(q, sizeof(q), "LOG%d(%d)", bases[i], v);
+      }
+    }
+    bool clash = false;   // not the same question twice on the field
+    for (int i = 0; i < MAX_EN; i++) if (G.en[i].alive && &G.en[i] != e && !strcmp(G.en[i].q, q)) clash = true;
+    SDL_strlcpy(e->q, q, sizeof(e->q));
+    SDL_snprintf(e->word, sizeof(e->word), "%d", ans);
+    if (!clash) break;
+  }
+  e->len = (int)strlen(e->word); e->words = e->hp = 1;
+}
+
 static void pick_word(Enemy *e) {
   int r = G.rank;
+  if (G.mode == MODE_MATH) { math_question(e); return; }
   if (r <= 2 || (r == 3 && e->kind == K_BAT)) {
     const char *set = r == 0 ? (G.spawned < 6 ? "FJDK" : "ASDFJKL")
                     : r == 1 ? "ASDFGHJKLQWERTYUIOP" : "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -301,8 +379,10 @@ static void spawn(void) {
 static void kill_enemy(Enemy *e) {
   if (!e->alive || e->dying > 0) return;
   e->doomed = true; e->dying = 0.3f;
-  G.kills++;
-  G.score += 10 * e->len;
+  if (G.mode != MODE_DRIVE) {   // in the driver's test, questions are counted, not monsters
+    G.kills++;
+    G.score += G.mode == MODE_MATH ? 50 + 10 * (int)strlen(e->q) : 10 * e->len;
+  }
   puff(e->x, enemy_y(e), e->kind == K_BAT ? C_PURPLE : e->kind == K_BRUTE ? C_SKIN : C_ZOMBIE, 10);
   sfx(WAVE_NOISE, 0, 0, 0.12f, 0.20f, 0);
   sfx(WAVE_SQUARE, 330, -900, 0.14f, 0.10f, 0);
@@ -391,8 +471,27 @@ static char next_char(void) {
   return i < 0 ? 0 : G.en[i].word[G.en[i].typed];
 }
 
+static void quiz_resolve(int choice);
+
 static void type_char(char c) {
   Enemy *e = NULL;
+  if (G.mode == MODE_DRIVE) {   // a letter picks an answer
+    if (G.q_active && c >= 'A' && c < 'A' + G.q_n) quiz_resolve(c - 'A');
+    return;
+  }
+  // Two answers can start the same way (12 and 15). If the next key does not
+  // fit the locked monster but does continue another one's answer, move the lock.
+  if (G.target >= 0 && G.en[G.target].alive && !G.en[G.target].doomed && G.en[G.target].word[G.en[G.target].typed] != c) {
+    Enemy *old = &G.en[G.target];
+    for (int i = 0; i < MAX_EN; i++) {
+      Enemy *o = &G.en[i];
+      if (!o->alive || o->doomed || o == old || o->typed || o->words > 1 || old->words > 1) continue;
+      if (!strncmp(o->word, old->word, (size_t)old->typed) && o->word[old->typed] == c) {
+        o->typed = old->typed; old->typed = 0; G.target = i;
+        break;
+      }
+    }
+  }
   if (G.target >= 0 && G.en[G.target].alive && !G.en[G.target].doomed) e = &G.en[G.target];
   else {
     G.target = -1;
@@ -489,10 +588,10 @@ static void boss_end(bool won) {
     G.score += 500;
     puff(G.boss_x, boss_cy(), bosses[G.boss_kind].color, 30); puff(G.boss_x, boss_cy() - 20, C_YELLOW, 20);
     for (int i = 0; i < MAX_EN; i++) if (G.en[i].alive && !G.en[i].doomed) kill_enemy(&G.en[i]);
-    G.hp = G.hp + 2 > MAX_HP ? MAX_HP : G.hp + 2;
+    if (G.mode != MODE_DRIVE) G.hp = G.hp + 2 > MAX_HP ? MAX_HP : G.hp + 2;   // test misses are not healed
     for (int i = 0; i < 4; i++) sfx(WAVE_SQUARE, midi_hz(69 + i * 4 + (i == 3 ? 0 : 0)), 0, 0.12f, 0.12f, i * 0.1f);
   } else {
-    hurt_wall(2, false);
+    if (G.mode != MODE_DRIVE) hurt_wall(2, false);
     sfx(WAVE_SQUARE, 220, -150, 0.6f, 0.12f, 0);
   }
   G.boss_timer = BOSS_MIN_GAP + rndf() * BOSS_RANDOM_GAP;
@@ -523,7 +622,7 @@ static void boss_judge(const char *label, Uint32 color) {
 
 // Judgement windows are StepMania's defaults: 22.5, 45, 90 and 135 ms, with its
 // widest 180 ms window kept only for the beginner ranks.
-static double hit_window(void) { return G.rank < 3 ? 0.180 : 0.135; }
+static double hit_window(void) { return ranks[G.rank].chart <= 1 && !(G.mode == MODE_TYPE && G.rank == 3) ? 0.180 : 0.135; }
 
 static void boss_press(int col) {
   if (G.sub != SUB_BOSS) return;
@@ -558,7 +657,7 @@ static void boss_update(float dt) {
     if (n->state == 0 && t > note_time(n) + (hit_window())) {
       n->state = 2; G.misses++; G.combo = 0;
       boss_judge("MISS", C_RED);
-      if (G.rank >= 3 && G.misses % 8 == 0) hurt_wall(1, false);
+      if (G.mode != MODE_DRIVE && G.rank >= 3 && G.misses % 8 == 0) hurt_wall(1, false);
     }
   }
   if (T.bot > 0)
@@ -573,10 +672,16 @@ static void boss_update(float dt) {
 // ---- game flow -------------------------------------------------------------------
 static void start_rank(int r) {
   float boss_timer = G.boss_timer;
-  int score = G.score, sel = G.sel, streak = G.streak, weapon = G.weapon, wstreak = G.wstreak;
+  int score = G.score, sel = G.sel, streak = G.streak, weapon = G.weapon, wstreak = G.wstreak, mode = G.mode;
   SDL_memset(&G, 0, sizeof(G));
+  G.mode = mode;
   G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak; G.weapon = weapon; G.wstreak = wstreak;
-  G.hp = MAX_HP; G.target = -1; G.last_lane = -1; G.ward = 1;
+  G.hp = G.hp_max = MAX_HP; G.target = -1; G.last_lane = -1; G.ward = 1;
+  if (G.mode == MODE_DRIVE) {
+    G.hp = G.hp_max = r == 0 ? 3 : 7;   // misses allowed, plus one
+    for (int i = 0; i < NQUIZ; i++) G.q_order[i] = (Uint8)i;
+    for (int i = NQUIZ - 1; i > 0; i--) { int j = rndi(i + 1); Uint8 t = G.q_order[i]; G.q_order[i] = G.q_order[j]; G.q_order[j] = t; }
+  }
   G.spawn_t = 1.0f; G.archer_y = (float)LANE_Y(1);
   G.boss_timer = boss_timer > 0 ? boss_timer : BOSS_MIN_GAP + rndf() * BOSS_RANDOM_GAP;
   audio_song(SONG_TYPING);
@@ -750,11 +855,11 @@ static void load_game(void) {
 }
 
 static void go_title(void) {
-  int sel = G.sel;
+  int sel = G.sel, mode = G.mode;
   set_paused(false);
   A.song_muted = false;
   SDL_memset(&G, 0, sizeof(G));
-  G.state = ST_TITLE; G.sel = sel; G.target = -1;
+  G.state = ST_TITLE; G.sel = sel; G.mode = mode; G.target = -1;
   audio_song(SONG_TYPING);
 }
 
@@ -768,8 +873,73 @@ static void update_wpm(float dt) {
   if (G.rank_clock > WPM_WINDOW && G.wpm > G.best_wpm) G.best_wpm = G.wpm;
 }
 
+// ---- driver's test ---------------------------------------------------------------------
+static const Quiz *quiz_now(void) { return &quiz_bank[G.q_order[G.q_num % NQUIZ]]; }
+
+// Ask the next question: one monster per answer, lettered from the top lane down.
+static void quiz_next(void) {
+  const Quiz *Q = quiz_now();
+  G.q_n = 0;
+  while (G.q_n < 4 && Q->a[G.q_n]) G.q_n++;
+  for (int i = 0; i < G.q_n; i++) G.q_perm[i] = (Uint8)i;
+  for (int i = G.q_n - 1; i > 0; i--) { int j = rndi(i + 1); Uint8 t = G.q_perm[i]; G.q_perm[i] = G.q_perm[j]; G.q_perm[j] = t; }
+  for (int i = 0; i < MAX_EN; i++) G.en[i].alive = false;
+  for (int i = 0; i < G.q_n; i++) {
+    Enemy *e = &G.en[i];
+    *e = (Enemy){ .alive = true, .kind = K_ZOMBIE, .lane = i, .variant = i % 3, .x = 292, .len = 1, .words = 1, .hp = 1 };
+    e->word[0] = (char)('A' + i);
+  }
+  G.q_active = true; G.q_pick = -1; G.target = -1;
+}
+
+// An answer was chosen (or -1: the monsters reached the wall first).
+static void quiz_resolve(int choice) {
+  bool right = choice >= 0 && G.q_perm[choice] == 0;
+  G.q_active = false; G.q_pick = choice; G.kills++;
+  G.q_reveal = right ? 1.3f : 3.0f;   // a miss leaves the right answer up longer
+  for (int i = 0; i < G.q_n; i++) {
+    Enemy *e = &G.en[i];
+    e->doomed = true;
+    if (right && i == choice) { G.archer_y = (float)LANE_Y(e->lane); fire(e->x, enemy_y(e), i, false); }
+    else { e->dying = 0.3f; puff(e->x, enemy_y(e), right ? C_ZOMBIE : C_RED, 6); }
+  }
+  if (right) {
+    G.q_right++; G.correct++; G.streak++; G.score += 100;
+    sfx(WAVE_SQUARE, 880, 600, 0.12f, 0.10f, 0);
+  } else {
+    G.wrong++; G.streak = 0;
+    hurt_wall(1, true);
+  }
+}
+
+static void update_quiz(float dt) {
+  const Rank *R = &ranks[G.rank];
+  if (G.q_reveal > 0) {
+    G.q_reveal -= dt;
+    if (G.q_reveal > 0) return;
+    G.q_num++;
+    for (int i = 0; i < MAX_EN; i++) G.en[i].alive = false;
+    if (G.boss_timer <= 0 && G.kills < R->quota - 1) { boss_start(); return; }   // bosses only come between questions
+  }
+  if (!G.q_active) { if (G.kills < R->quota) quiz_next(); return; }
+  G.boss_timer -= dt;
+  bool ready = true;
+  for (int i = 0; i < G.q_n; i++) {
+    Enemy *e = &G.en[i];
+    e->anim += dt;
+    if (e->rise < 1) { e->rise += dt * 1.2f; ready = false; continue; }
+    if (e->x > WALL_STOP) e->x -= R->speed * dt;
+    else { quiz_resolve(-1); return; }
+  }
+  if (T.bot > 0 && ready) {   // the test bot always knows the answer
+    T.bot_t -= dt;
+    if (T.bot_t <= 0) { T.bot_t = 1.0f / T.bot; for (int i = 0; i < G.q_n; i++) if (G.q_perm[i] == 0) { quiz_resolve(i); break; } }
+  }
+}
+
 static void update_typing(float dt) {
   const Rank *R = &ranks[G.rank];
+  if (G.mode == MODE_DRIVE) { update_quiz(dt); return; }
   int alive = count_alive();
   // The typing clock only runs while there is something to type.
   if (alive > 0) { G.tclock += dt; G.rank_clock += dt; }
@@ -871,8 +1041,8 @@ static void update(float dt) {
     G.hp = 0; G.state = ST_GAMEOVER; G.state_t = 0;
     audio_song(SONG_NONE);
     for (int i = 0; i < 4; i++) sfx(WAVE_SQUARE, midi_hz(57 - i * 3), 0, 0.3f, 0.14f, i * 0.28f);
-  } else if (G.kills >= ranks[G.rank].quota && G.sub == SUB_TYPING) {
-    G.state = G.rank + 1 >= NRANKS ? ST_VICTORY : ST_RANKUP; G.state_t = 0;
+  } else if (G.kills >= ranks[G.rank].quota && G.sub == SUB_TYPING && G.q_reveal <= 0) {
+    G.state = G.rank + 1 >= NRANKS || G.mode == MODE_DRIVE ? ST_VICTORY : ST_RANKUP; G.state_t = 0;
     for (int i = 0; i < 5; i++) sfx(WAVE_SQUARE, midi_hz(69 + (int[]){ 0, 4, 7, 12, 16 }[i]), 0, 0.14f, 0.12f, i * 0.11f);
   }
 }
@@ -986,6 +1156,27 @@ static void draw_words(float x, float y, const Enemy *e, int from, int to, bool 
 
 static void draw_label(const Enemy *e, bool targeted) {
   if (e->doomed || e->rise < 0.3f) return;
+  if (G.mode == MODE_DRIVE) {   // just the answer's letter, beside the monster and in its colour
+    char letter[2] = { e->word[0], 0 };
+    float lx = SDL_floorf(e->x) - 24, ly = (float)(LANE_Y(e->lane) - 19);
+    rect(lx - 1, ly - 1, 15, 15, C_BLACK);
+    rect(lx, ly, 13, 13, word_colors[e->lane % 4]);
+    text(lx + 2, ly + 3, letter, C_BLACK, 1); text(lx + 3, ly + 3, letter, C_BLACK, 1);
+    return;
+  }
+  if (G.mode == MODE_MATH) {   // the question, then whatever of the answer has been typed
+    char shown[40];
+    SDL_snprintf(shown, sizeof(shown), "%s=%.*s", e->q, e->typed, e->word);
+    int mw = ((int)strlen(e->q) + 1 + e->len) * FONT_W + 5;
+    float mtop = e->kind == K_BAT ? enemy_y(e) - 8 : (float)(LANE_Y(e->lane) - (e->kind == K_BRUTE ? 30 : 24));
+    float mx = SDL_clamp(SDL_floorf(e->x - mw / 2.0f), 2.0f, (float)(SCREEN_W - 2 - mw)), my = SDL_floorf(mtop - 12);
+    rect(mx, my, (float)mw, 11, C_BLACK);
+    frame(mx, my, (float)mw, 11, targeted ? C_YELLOW : C_DGREY);
+    float tx = text_n(mx + 3, my + 2, shown, (int)strlen(e->q) + 1, C_WHITE, 1);
+    text(tx, my + 2, shown + strlen(e->q) + 1, C_YELLOW, 1);
+    if (targeted && ((int)(G.time * 6) & 1)) rect(tx + (float)(e->typed * FONT_W), my + 8, 5, 1, C_YELLOW);
+    return;
+  }
   int w = text_w(e->word, 1) + 6;
   float top = e->kind == K_BAT ? enemy_y(e) - 8 : (float)(LANE_Y(e->lane) - (e->kind == K_BRUTE ? 30 : 24));
   float x = SDL_floorf(e->x - w / 2.0f), y = SDL_floorf(top - 12);
@@ -1057,7 +1248,14 @@ static void draw_typing_hud(void) {
   if (i >= 0) {
     const Enemy *e = &G.en[i];
     bool locked = G.target >= 0;
-    if (e->words == 1) {
+    if (G.mode == MODE_MATH) {
+      char shown[40];
+      SDL_snprintf(shown, sizeof(shown), "%s=%.*s", e->q, e->typed, e->word);
+      int scale = strlen(shown) + (size_t)(e->len - e->typed) > 9 ? 2 : 3;
+      float x = SDL_floorf(238 - (float)((strlen(e->q) + 1 + (size_t)e->len) * FONT_W * scale) / 2.0f);
+      float tx = text_n(x, scale == 2 ? 212.0f : 208.0f, shown, (int)strlen(e->q) + 1, C_WHITE, scale);
+      text(tx, scale == 2 ? 212.0f : 208.0f, shown + strlen(e->q) + 1, C_YELLOW, scale);
+    } else if (e->words == 1) {
       int scale = e->len > 6 ? 2 : 3;
       draw_words(238 - text_w(e->word, scale) / 2.0f, scale == 2 ? 212.0f : 208.0f, e, 0, e->len, locked, scale);
     } else {
@@ -1197,6 +1395,38 @@ static void draw_boss(void) {
   }
 }
 
+// Greedy word wrap. Returns the number of lines used; draws only if `draw`.
+static int text_wrap(float x, float y, const char *s, int cols, Uint32 color, bool draw) {
+  int lines = 0;
+  while (*s) {
+    int n = (int)strlen(s);
+    if (n > cols) { n = cols; while (n > 0 && s[n] != ' ') n--; if (n == 0) n = cols; }
+    if (draw) text_n(x, y + (float)(lines * 9), s, n, color, 1);
+    lines++; s += n;
+    while (*s == ' ') s++;
+  }
+  return lines;
+}
+
+// The question and its lettered answers, on a board across the sky. Once it is
+// answered the right answer turns green and a wrong pick turns red.
+static void draw_quiz(void) {
+  if (!G.q_active && G.q_reveal <= 0) return;
+  const Quiz *Q = quiz_now();
+  rect_a(2, 17, 316, 80, 0x000018, 240);
+  frame(2, 17, 316, 80, C_DPURP);
+  int lines = text_wrap(8, 21, Q->q, 50, C_WHITE, true);
+  float y = 21 + (float)(lines * 9) + 4;
+  for (int i = 0; i < G.q_n; i++, y += 10) {
+    bool right = G.q_perm[i] == 0, shown = !G.q_active;
+    Uint32 color = !shown ? C_GREY : right ? C_ZOMBIE : i == G.q_pick ? C_RED : C_DGREY;
+    char letter[2] = { (char)('A' + i), 0 };
+    rect(8, y - 1, 9, 9, shown ? color : word_colors[i]);
+    text(10, y, letter, C_BLACK, 1);
+    text(22, y, Q->a[G.q_perm[i]], color, 1);
+  }
+}
+
 static void draw_play(void) {
   const Rank *R = &ranks[G.rank];
   char buf[64];
@@ -1224,16 +1454,18 @@ static void draw_play(void) {
   rect(0, 0, SCREEN_W, 15, C_BLACK); rect(0, 15, SCREEN_W, 1, C_DGREY);
   SDL_snprintf(buf, sizeof(buf), "R%d %s", G.rank + 1, R->name);
   text(4, 4, buf, C_YELLOW, 1);
-  SDL_snprintf(buf, sizeof(buf), "SLAIN %d/%d", G.kills, R->quota);
-  text(76, 4, buf, C_WHITE, 1);
+  if (G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "RIGHT %d/%d", G.q_right, G.kills);
+  else SDL_snprintf(buf, sizeof(buf), "%s %d/%d", G.mode == MODE_MATH ? "SOLVED" : "SLAIN", G.kills, R->quota);
+  text(G.mode == MODE_TYPE ? 76.0f : 82.0f, 4, buf, C_WHITE, 1);
   SDL_snprintf(buf, sizeof(buf), "PTS %d", G.score);
-  text(154, 4, buf, C_CYAN, 1);
-  for (int i = 0; i < MAX_HP; i++) {
-    if (i < G.hp) spr(s_heart, (float)(236 + i * 8), 5);
+  text(G.mode == MODE_TYPE ? 154.0f : 166.0f, 4, buf, C_CYAN, 1);
+  for (int i = MAX_HP - G.hp_max; i < MAX_HP; i++) {
+    if (i - (MAX_HP - G.hp_max) < G.hp) spr(s_heart, (float)(236 + i * 8), 5);
     else rect((float)(238 + i * 8), 7, 3, 2, C_DGREY);
   }
 
-  if (!boss) {   // current weapon, and how far the clean run is from the next one
+  if (G.mode == MODE_DRIVE && !boss) draw_quiz();
+  if (!boss && G.mode != MODE_DRIVE) {   // current weapon, and how far the clean run is from the next one
     int w = weapon_now();
     if (w + 1 >= NWEAPONS) SDL_snprintf(buf, sizeof(buf), "LV%d %s  KEEP %d WPM", w + 1, weapons[w].name, TOP_WEAPON_WPM);
     else if (w + 2 >= NWEAPONS && G.wstreak >= weapons[w + 1].need)
@@ -1254,7 +1486,13 @@ static void draw_play(void) {
     text_center(160, 216, "FINGERS BACK ON F AND J", C_WHITE, 1);
     char s[2] = { (char)('0' + (int)ceilf(G.out_t)), 0 };
     text_center(160, 227, s, C_CYAN, 1);
-  } else if (G.rank <= 2) draw_keyboard(next_char());
+  } else if (G.mode == MODE_DRIVE) {
+    SDL_snprintf(buf, sizeof(buf), "QUESTION %d OF %d", SDL_min(G.kills + (G.q_active ? 1 : 0), R->quota), R->quota);
+    text_center(160, 204, buf, C_WHITE, 1);
+    SDL_snprintf(buf, sizeof(buf), "MISSES LEFT: %d", G.hp - 1);
+    text_center(160, 216, buf, G.hp > 2 ? C_GREY : C_RED, 1);
+    text_center(160, 228, "PRESS THE LETTER OF THE RIGHT ANSWER", C_CYAN, 1);
+  } else if (G.mode == MODE_TYPE && G.rank <= 2) draw_keyboard(next_char());
   else draw_typing_hud();
 
   if (G.msg_t > 0) text_center(160, 70, G.msg, G.msg_color, 2);
@@ -1269,9 +1507,18 @@ static void overlay(int alpha) { rect_a(0, 0, SCREEN_W, SCREEN_H, C_BLACK, alpha
 static void draw_title(void) {
   SDL_RenderTexture(ren, bg_tex, NULL, NULL);
   overlay(150);
-  text_center(160, 14, "HOME ROW", C_RED, 4);
-  text_center(160, 46, "HORDE", C_YELLOW, 4);
-  text_center(160, 80, "TYPE TO HOLD THE WALL", C_WHITE, 1);
+  text_center(160, 10, "HOME ROW", C_RED, 4);
+  text_center(160, 42, "HORDE", C_YELLOW, 4);
+  // the three games, side by side
+  float tab = 34;
+  for (int m = 0; m < NMODES; m++) {
+    int w = text_w(mode_names[m], 1) + 12;
+    if (m == G.mode) rect(tab, 76, (float)w, 13, C_YELLOW);
+    else frame(tab, 76, (float)w, 13, C_DGREY);
+    text(tab + 6, 79, mode_names[m], m == G.mode ? C_BLACK : C_GREY, 1);
+    tab += (float)w + 26;
+  }
+  text(22, 79, "<", C_WHITE, 1); text(292, 79, ">", C_WHITE, 1);
   for (int i = 0; i < NRANKS; i++) {
     float y = (float)(98 + i * 12);
     bool on = i == G.sel;
@@ -1279,10 +1526,15 @@ static void draw_title(void) {
     if (on) { rect_a(24, y - 2, 272, 11, C_DPURP, 255); text(28, y, ">", C_YELLOW, 1); }
     SDL_snprintf(buf, sizeof(buf), "%d %s", i + 1, ranks[i].name);
     text(40, y, buf, on ? C_YELLOW : C_GREY, 1);
-    text(112, y, ranks[i].blurb, on ? C_WHITE : C_DGREY, 1);
+    text(118, y, ranks[i].blurb, on ? C_WHITE : C_DGREY, 1);
+  }
+  if (G.mode == MODE_DRIVE) {
+    text_center(160, 134, "PRACTICE QUESTIONS WRITTEN FROM THE", C_DGREY, 1);
+    text_center(160, 144, "IDAHO DRIVER'S HANDBOOK, JULY 2026.", C_DGREY, 1);
+    text_center(160, 154, "NOT THE OFFICIAL TEST. STUDY THE HANDBOOK.", C_DGREY, 1);
   }
   if (G.msg_t > 0) text_center(160, 200, G.msg, G.msg_color, 1);
-  else text_center(160, 200, "UP / DOWN OR 1-8: CHOOSE YOUR RANK   F7: LOAD", C_GREY, 1);
+  else text_center(160, 200, "LEFT / RIGHT: GAME   UP / DOWN: LEVEL   F7: LOAD", C_GREY, 1);
   if ((int)(G.time * 2) & 1) text_center(160, 214, "PRESS ENTER TO START", C_WHITE, 1);
 #ifndef __EMSCRIPTEN__
   text_center(160, 228, "F2: CALIBRATE THE BEAT   F11: FULLSCREEN", C_DGREY, 1);
@@ -1297,22 +1549,25 @@ static void draw_banner(void) {
   float avg = G.rank_clock > 1 ? (float)G.correct / 5.0f / (G.rank_clock / 60.0f) : 0;
   overlay(170);
   if (G.state == ST_GAMEOVER) {
-    text_center(160, 60, "THE WALL HAS", C_RED, 3);
-    text_center(160, 86, "FALLEN", C_RED, 3);
+    text_center(160, 60, G.mode == MODE_DRIVE ? "TEST FAILED" : "THE WALL HAS", C_RED, 3);
+    text_center(160, 86, G.mode == MODE_DRIVE ? "TOO MANY MISSES" : "FALLEN", C_RED, G.mode == MODE_DRIVE ? 2 : 3);
     text_center(160, 150, "ENTER: TRY THIS RANK AGAIN", C_WHITE, 1);
     text_center(160, 164, "ESC: BACK TO THE TITLE", C_GREY, 1);
   } else if (G.state == ST_VICTORY) {
-    text_center(160, 50, "DAWN BREAKS!", C_YELLOW, 3);
-    text_center(160, 82, "THE COMPOUND IS SAFE", C_WHITE, 2);
+    text_center(160, 50, G.mode == MODE_DRIVE ? "YOU PASSED!" : "DAWN BREAKS!", C_YELLOW, 3);
+    if (G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "%d OF %d CORRECT", G.q_right, G.kills);
+    else SDL_snprintf(buf, sizeof(buf), "THE COMPOUND IS SAFE");
+    text_center(160, 82, buf, C_WHITE, 2);
     text_center(160, 164, "ENTER: BACK TO THE TITLE", C_WHITE, 1);
   } else {
     text_center(160, 50, "RANK UP!", C_YELLOW, 4);
-    SDL_snprintf(buf, sizeof(buf), "YOU ARE NOW A %s", ranks[G.rank + 1].name);
+    SDL_snprintf(buf, sizeof(buf), "NEXT RANK: %s", ranks[G.rank + 1].name);
     text_center(160, 90, buf, C_WHITE, 1);
     text_center(160, 102, ranks[G.rank + 1].blurb, C_CYAN, 1);
     text_center(160, 164, "ENTER: NEXT NIGHT", C_WHITE, 1);
   }
-  SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
+  if (G.mode == MODE_TYPE) SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
+  else SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%", acc);
   text_center(160, 124, buf, C_GREY, 1);
   SDL_snprintf(buf, sizeof(buf), "SCORE %d", G.score);
   text_center(160, 136, buf, C_CYAN, 1);
@@ -1324,11 +1579,18 @@ static void update_status(void) {
   if (G.state == ST_TITLE) SDL_snprintf(buf, sizeof(buf), "Home Row Horde. Press Enter to start.");
   else if (G.state == ST_CALIBRATE) SDL_snprintf(buf, sizeof(buf), "Beat calibration, %s step. Tap space on every beat. Sound %d ms, sight %d ms.", Cal.mode == CAL_SIGHT ? "sight" : "sound", A.offset_ms, A.visual_ms);
   else if (G.state == ST_PLAY && G.paused) SDL_snprintf(buf, sizeof(buf), "Paused. Press Enter to keep playing.");
-  else if (G.state == ST_GAMEOVER) SDL_snprintf(buf, sizeof(buf), "The wall has fallen. Press Enter to try again.");
+  else if (G.state == ST_GAMEOVER) SDL_snprintf(buf, sizeof(buf), G.mode == MODE_DRIVE ? "Test failed: too many misses. Press Enter to try again." : "The wall has fallen. Press Enter to try again.");
+  else if (G.state == ST_VICTORY && G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "You passed! %d of %d correct.", G.q_right, G.kills);
   else if (G.state == ST_VICTORY) SDL_snprintf(buf, sizeof(buf), "Dawn breaks. You win! Score %d.", G.score);
   else if (G.state == ST_RANKUP) SDL_snprintf(buf, sizeof(buf), "Rank up! Press Enter for rank %d.", G.rank + 2);
   else if (G.sub == SUB_BOSS) SDL_snprintf(buf, sizeof(buf), "Boss battle: hit the arrow keys on the beat.");
-  else {
+  else if (G.mode == MODE_DRIVE)
+    SDL_snprintf(buf, sizeof(buf), "Driver's test. Question %d of %d. Right so far %d.", SDL_min(G.kills + (G.q_active ? 1 : 0), R->quota), R->quota, G.q_right);
+  else if (G.mode == MODE_MATH) {
+    int i = G.sub == SUB_TYPING ? (G.target >= 0 ? G.target : nearest_enemy()) : -1;
+    if (i >= 0) SDL_snprintf(buf, sizeof(buf), "Math rank %d %s. Solved %d/%d. Solve %s", G.rank + 1, R->name, G.kills, R->quota, G.en[i].q);
+    else SDL_snprintf(buf, sizeof(buf), "Math rank %d %s. Solved %d/%d.", G.rank + 1, R->name, G.kills, R->quota);
+  } else {
     char c = G.sub == SUB_TYPING ? next_char() : 0;
     if (c == ' ') SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Press the space bar.", G.rank + 1, R->name, G.kills, R->quota);
     else if (c) SDL_snprintf(buf, sizeof(buf), "Rank %d %s. Slain %d/%d. Type %c", G.rank + 1, R->name, G.kills, R->quota, c);
@@ -1405,6 +1667,11 @@ static void key_down(SDL_Keycode key) {
     }
     case ST_TITLE:
       if (key == SDLK_F2) { calibrate_start(); break; }
+      if (key == SDLK_LEFT || key == SDLK_RIGHT) {   // switch between typing, math, and the driver's test
+        G.mode = (G.mode + (key == SDLK_RIGHT ? 1 : NMODES - 1)) % NMODES; G.sel = 0;
+        sfx(WAVE_SQUARE, 880, 0, 0.04f, 0.08f, 0);
+        break;
+      }
       if (key == SDLK_UP) { G.sel = (G.sel + NRANKS - 1) % NRANKS; sfx(WAVE_SQUARE, 660, 0, 0.04f, 0.08f, 0); }
       else if (key == SDLK_DOWN) { G.sel = (G.sel + 1) % NRANKS; sfx(WAVE_SQUARE, 660, 0, 0.04f, 0.08f, 0); }
       else if (key >= SDLK_1 && key < SDLK_1 + NRANKS) G.sel = (int)(key - SDLK_1);
@@ -1434,6 +1701,9 @@ static void key_down(SDL_Keycode key) {
         sfx(WAVE_SQUARE, 1320, 0, 0.12f, 0.1f, 0);
       } else if (G.sub == SUB_TYPING) {
         if (key >= SDLK_A && key <= SDLK_Z) type_char((char)('A' + (key - SDLK_A)));
+        else if (key >= SDLK_0 && key <= SDLK_9) type_char((char)('0' + (key - SDLK_0)));
+        else if (key >= SDLK_KP_1 && key <= SDLK_KP_9) type_char((char)('1' + (key - SDLK_KP_1)));
+        else if (key == SDLK_KP_0) type_char('0');
         else if (key == SDLK_SPACE) type_char(' ');
         else if (key == SDLK_BACKSPACE) G.target = -1;
       }
@@ -1492,7 +1762,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   settings_load();
   go_title();
 #ifndef __EMSCRIPTEN__
-  if (getenv("HRH_RANK")) new_game(atoi(getenv("HRH_RANK")) - 1);
+  if (getenv("HRH_MODE")) G.mode = SDL_clamp(atoi(getenv("HRH_MODE")) - 1, 0, NMODES - 1);
+  if (getenv("HRH_RANK")) new_game(SDL_clamp(atoi(getenv("HRH_RANK")) - 1, 0, NRANKS - 1));
   if (getenv("HRH_WEAPON")) G.weapon = SDL_clamp(atoi(getenv("HRH_WEAPON")) - 1, 0, NWEAPONS - 1);
   if (getenv("HRH_CALIB")) {   // show the calibration screen with some sample taps
     calibrate_start();

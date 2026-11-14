@@ -116,6 +116,40 @@ test('F6 saves the game and F7 loads it back, paused, even after a reload', asyn
   await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
 });
 
+test('math mode asks sums and takes the answer in digits', async ({ page }) => {
+  await page.goto('/');
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Enter');
+  // The first question is always 1+1; a wrong digit must not solve it.
+  await expect(status).toHaveText('Math rank 1 COUNTER. Solved 0/12. Solve 1+1');
+  await page.keyboard.press('3');
+  await expect(status).toHaveText('Math rank 1 COUNTER. Solved 0/12. Solve 1+1');
+  await page.keyboard.press('2');
+  await expect(status).toContainText('Solved 1/12');
+  // Work out the next one the way a player would.
+  await expect(status).toHaveText(/Solve \d+\+\d+$/);
+  const [, a, b] = (await status.textContent()).match(/Solve (\d+)\+(\d+)$/);
+  for (const digit of String(Number(a) + Number(b))) await page.keyboard.press(digit);
+  await expect(status).toContainText('Solved 2/12');
+});
+
+test('the driver\'s test asks multiple-choice questions and moves on after an answer', async ({ page }) => {
+  await page.goto('/');
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText("Driver's test. Question 1 of 10. Right so far 0.");
+  await page.keyboard.press('a');
+  // Right or wrong, the answer is shown and then the next question arrives.
+  await expect(status).toHaveText(/^Driver's test\. Question 2 of 10\. Right so far [01]\.$/, { timeout: 10000 });
+});
+
 test('the canvas scales down to phone width without losing its shape', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
