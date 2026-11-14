@@ -8,7 +8,7 @@
 #include <math.h>
 
 #define SR 44100
-enum { SONG_NONE, SONG_TYPING, SONG_DANCE };
+enum { SONG_NONE, SONG_TYPING, SONG_DANCE, SONG_CALIBRATE };
 enum { WAVE_SQUARE, WAVE_NOISE, WAVE_TRI };
 
 // The dance song: 120 BPM, one step per eighth note, two count-in bars and then
@@ -44,7 +44,8 @@ static struct {
   Sint64 generated;          // samples generated so far
   double clock;              // smoothed playback position, in seconds of samples
   double latency;            // estimated delay between that position and the speakers
-  int offset_ms;             // the player's own adjustment, set on the pause screen
+  int offset_ms;             // the player's own adjustment, from calibration or the pause screen
+  Uint64 pump_ns;            // when the clock was last advanced, for timing key presses between frames
   int song, step;
   Sint64 song_start;         // sample index where the current song began
   double step_len, step_pos; // in samples
@@ -68,6 +69,12 @@ static void audio_step(void) {
     if (typing_lead[p]) { A.lead_f = midi_hz(typing_lead[p]); A.lead_env = 1; A.lead_vol = 0.07f; }
     if (typing_bass[p]) { A.bass_f = midi_hz(typing_bass[p]); A.bass_env = 1; }
     if (p % 8 == 0) A.kick_t = 0;
+  } else if (A.song == SONG_CALIBRATE) {
+    // A bare 4/4 click: kick and tick on every beat, a higher tick on beat one.
+    if (s % 2 == 0) {
+      A.kick_t = 0; A.hat_env = 1;
+      A.lead_f = midi_hz(s % 8 == 0 ? 88 : 81); A.lead_env = 0.6f; A.lead_vol = 0.12f;
+    }
   } else if (A.song == SONG_DANCE) {
     if (s < DANCE_COUNT_IN) {
       // Count-in: a tick on every beat, pitched up for the final "3, 2, 1".
@@ -89,7 +96,7 @@ static void audio_step(void) {
 
 static void audio_song(int song) {
   A.song = song; A.step = 0; A.step_pos = 0; A.song_start = A.generated;
-  A.step_len = SR * 60.0 / (song == SONG_DANCE ? DANCE_BPM : TYPING_BPM) / 2.0;
+  A.step_len = SR * 60.0 / (song == SONG_TYPING ? TYPING_BPM : DANCE_BPM) / 2.0;
   A.lead_env = A.bass_env = A.snare_env = A.hat_env = 0; A.kick_t = 1;
   if (song) audio_step();
 }
@@ -183,12 +190,22 @@ static void audio_pump(float dt) {
   A.clock += dt;
   double err = raw - A.clock;
   if (err > 0.15 || err < -0.15) A.clock = raw; else A.clock += err * 0.05;
+  A.pump_ns = SDL_GetTicksNS();
 }
 
-// Seconds into the current song, as the player is hearing it right now.
-static double audio_song_time(void) {
+// Seconds into the current song as it is heard, before the player's own offset.
+// Pass the timestamp of a key press (or 0 for "this frame") so that presses are
+// timed to when they happened rather than to the frame that noticed them.
+static double audio_raw_time_at(Uint64 ns) {
   if (A.fake) return (double)(A.generated - A.song_start) / SR;
-  return A.clock - (double)A.song_start / SR - A.latency - A.offset_ms / 1000.0;
+  double t = A.clock - (double)A.song_start / SR - A.latency;
+  if (ns && A.pump_ns) {
+    double d = ((double)ns - (double)A.pump_ns) / 1e9;
+    t += d > 0.1 ? 0.1 : d < -0.1 ? -0.1 : d;
+  }
+  return t;
 }
+static double audio_song_time_at(Uint64 ns) { return audio_raw_time_at(ns) - (A.fake ? 0 : A.offset_ms / 1000.0); }
+static double audio_song_time(void) { return audio_song_time_at(0); }
 
 #endif

@@ -60,6 +60,31 @@ test('a higher rank can be chosen from the title and uses whole words', async ({
   await expect(status).toContainText('Slain 1/16');
 });
 
+test('F2 opens beat calibration, and tapping along measures and saves a delay', async ({ page }) => {
+  await page.goto('/');
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('F2');
+  await expect(status).toHaveText('Beat calibration. Tap space on every beat. Saved delay 0 ms.');
+  // Nudging changes the saved delay, and it survives a reload.
+  await page.keyboard.press('Equal');
+  await page.keyboard.press('Equal');
+  await expect(status).toContainText('Saved delay 10 ms.');
+  // Tap steadily for a while (half a second apart, like the click), then save what was measured.
+  await page.waitForTimeout(1200);
+  for (let i = 0; i < 10; i++) { await page.keyboard.press('Space'); await page.waitForTimeout(500); }
+  await page.keyboard.press('Enter');
+  await expect(status).not.toContainText('Saved delay 10 ms.');
+  const saved = (await status.textContent()).match(/Saved delay (-?\d+) ms/)[1];
+  await page.reload();
+  await page.locator('canvas').click();
+  await page.keyboard.press('F2');
+  await expect(status).toContainText(`Saved delay ${saved} ms.`);
+  await page.keyboard.press('Escape');
+  await expect(status).toHaveText(TITLE);
+});
+
 test('the canvas scales down to phone width without losing its shape', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
