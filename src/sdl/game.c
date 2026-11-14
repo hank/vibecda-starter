@@ -233,6 +233,13 @@ static Uint32 rng_state = 0xC0FFEE;
 static struct { const char *shot; int frames, frame; float bot, bot_t; bool on; } T;
 
 static Uint32 rnd(void) { rng_state ^= rng_state << 13; rng_state ^= rng_state >> 17; rng_state ^= rng_state << 5; return rng_state; }
+// Scramble a seed thoroughly first: the generator on its own leaves nearby
+// seeds (two launches a moment apart) producing nearly the same sequence.
+static void seed_rng(Uint32 x) {
+  x ^= x >> 16; x *= 0x7FEB352Du; x ^= x >> 15; x *= 0x846CA68Bu; x ^= x >> 16;
+  rng_state = x ? x : 0xC0FFEE;
+  for (int i = 0; i < 16; i++) rnd();
+}
 static int rndi(int n) { return (int)(rnd() % (Uint32)n); }
 static float rndf(void) { return (float)(rnd() & 0xFFFF) / 65536.0f; }
 
@@ -1452,7 +1459,8 @@ static void draw_play(void) {
 
   // top bar
   rect(0, 0, SCREEN_W, 15, C_BLACK); rect(0, 15, SCREEN_W, 1, C_DGREY);
-  SDL_snprintf(buf, sizeof(buf), "R%d %s", G.rank + 1, R->name);
+  if (G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "%s", R->name);   // the test has no ranks to number
+  else SDL_snprintf(buf, sizeof(buf), "R%d %s", G.rank + 1, R->name);
   text(4, 4, buf, C_YELLOW, 1);
   if (G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "RIGHT %d/%d", G.q_right, G.kills);
   else SDL_snprintf(buf, sizeof(buf), "%s %d/%d", G.mode == MODE_MATH ? "SOLVED" : "SLAIN", G.kills, R->quota);
@@ -1758,6 +1766,17 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   s_tomb = SPRITE(tombstone, NULL); s_heart = SPRITE(heart, NULL); s_note = SPRITE(note_arrow, NULL);
   build_background();
 
+  // Seed from the clock so that every session differs (question order, words,
+  // bosses). Headless test runs keep the fixed seed and stay repeatable, unless
+  // HRH_SEED asks for a particular one.
+  if (!T.on) {
+    SDL_Time now = 0;
+    SDL_GetCurrentTime(&now);
+    seed_rng((Uint32)now ^ (Uint32)(now >> 32) ^ (Uint32)SDL_GetPerformanceCounter());
+  }
+#ifndef __EMSCRIPTEN__
+  else if (getenv("HRH_SEED")) seed_rng((Uint32)strtoul(getenv("HRH_SEED"), NULL, 10));
+#endif
   audio_init(T.on);
   settings_load();
   go_title();

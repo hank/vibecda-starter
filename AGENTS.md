@@ -17,7 +17,8 @@ the participant guides in docs/ are left as they were in the starter.
   typed as digits), and an Idaho driver's test (multiple choice). Driver's test
   questions live in src/sdl/drivers.h and were written from the Idaho Driver's
   Handbook; check any new or changed fact against the current handbook.
-  HRH_MODE=1..3 picks the mode in headless runs.
+  HRH_MODE=1..3 picks the mode in headless runs. Headless runs use a fixed
+  random seed unless HRH_SEED=n is set; normal play seeds from the clock.
 - The browser tests read the status line above the canvas, which the game
   updates from C (set_status in src/sdl/game.c). Keep the two in step.
 
