@@ -123,6 +123,7 @@ static struct {
   char msg[40]; float msg_t; Uint32 msg_color;
   // boss battle
   Note notes[DANCE_STEPS]; int nnotes, boss_hp, boss_max, hits, misses, combo;
+  int sync_offer;   // after a battle: the average timing in ms that D will fold into the sound delay
   float sync_sum, sync_sq; int sync_n;   // signed timing of this battle's hits, for the summary and AutoSync
   float boss_x, boss_flash, press_flash[4], hit_flash[4], out_t;
   Uint32 hit_color[4];
@@ -505,8 +506,13 @@ static void boss_end(bool won) {
     if (autosync && G.sync_n >= 12 && sd < 0.035f && ms != 0) {
       offset_set(A.offset_ms + SDL_clamp(ms, -20, 20));
       SDL_snprintf(buf, sizeof(buf), "AUTOSYNC: DELAY %+d MS", A.offset_ms);
-    } else SDL_snprintf(buf, sizeof(buf), "AVERAGE %d MS %s", abs(ms), ms >= 0 ? "LATE" : "EARLY");
-    say(buf, C_CYAN, 2.5f);
+      say(buf, C_CYAN, 2.5f);
+    } else {
+      SDL_snprintf(buf, sizeof(buf), "AVERAGE %d MS %s", abs(ms), ms >= 0 ? "LATE" : "EARLY");
+      say(buf, C_CYAN, ms ? 5.0f : 2.5f);
+      // Offer to fold that into the sound delay, and hold the pause a little longer to allow it.
+      if (ms) { G.sync_offer = ms; G.out_t = 5.0f; }
+    }
   }
 }
 
@@ -835,7 +841,7 @@ static void update(float dt) {
 
   if (G.sub == SUB_TYPING) update_typing(dt);
   else if (G.sub == SUB_BOSS) boss_update(dt);
-  else { G.out_t -= dt; if (G.out_t <= 0) G.sub = SUB_TYPING; }
+  else { G.out_t -= dt; if (G.out_t <= 0) { G.sub = SUB_TYPING; G.sync_offer = 0; } }
 
   for (int i = 0; i < (int)SDL_arraysize(G.bolts); i++) {
     Bolt *b = &G.bolts[i];
@@ -1252,6 +1258,10 @@ static void draw_play(void) {
   else draw_typing_hud();
 
   if (G.msg_t > 0) text_center(160, 70, G.msg, G.msg_color, 2);
+  if (G.sub == SUB_BOSS_OUT && G.sync_offer) {
+    SDL_snprintf(buf, sizeof(buf), "PRESS D TO SET YOUR DELAY TO %+d MS", A.offset_ms + G.sync_offer);
+    text_center(160, 92, buf, C_WHITE, 1);
+  }
 }
 
 static void overlay(int alpha) { rect_a(0, 0, SCREEN_W, SCREEN_H, C_BLACK, alpha); }
@@ -1414,6 +1424,14 @@ static void key_down(SDL_Keycode key) {
         else if (key == SDLK_S || key == SDLK_DOWN) boss_press(1);
         else if (key == SDLK_W || key == SDLK_UP) boss_press(2);
         else if (key == SDLK_D || key == SDLK_RIGHT) boss_press(3);
+      } else if (G.sub == SUB_BOSS_OUT && key == SDLK_D && G.sync_offer) {
+        // Fold the battle's average timing into the sound delay; offset_set also saves it.
+        char buf[40];
+        offset_set(A.offset_ms + G.sync_offer);
+        G.sync_offer = 0;
+        SDL_snprintf(buf, sizeof(buf), "DELAY SAVED: %+d MS", A.offset_ms);
+        say(buf, C_ZOMBIE, 2.0f);
+        sfx(WAVE_SQUARE, 1320, 0, 0.12f, 0.1f, 0);
       } else if (G.sub == SUB_TYPING) {
         if (key >= SDLK_A && key <= SDLK_Z) type_char((char)('A' + (key - SDLK_A)));
         else if (key == SDLK_SPACE) type_char(' ');
