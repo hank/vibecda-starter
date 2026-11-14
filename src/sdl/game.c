@@ -110,6 +110,8 @@ static struct {
   int state, sub, rank, sel;
   bool paused;
   int hp, kills, spawned, score, streak, correct, wrong, target, last_lane;
+  int weapon, wstreak, miss_run;   // weapon level, clean keys since it changed, wrong keys in a row
+  float slow_t;                    // seconds the top weapon has spent under its WPM floor
   float time, spawn_t, tclock, rank_clock, ward, fear_t, shake, wall_flash, state_t;
   float archer_y, shoot_t;
   float key_times[256]; int key_head;
@@ -132,23 +134,46 @@ static struct {
 
 static SDL_Window *win;
 static SDL_Texture *screen_tex, *bg_tex;
-static Spr s_zombie[3][2], s_bat[2], s_brute, s_lich, s_archer, s_bolt[4], s_tomb, s_heart, s_note;
+static Spr s_zombie[3][2], s_bat[2], s_brute, s_lich, s_archer, s_bolt[7], s_tomb, s_heart, s_note;
 
-// The archer's weapon is earned by typing without a mistake: each streak length
-// below unlocks the next one, and a wrong key drops back to oak arrows. Better
-// weapons fly faster and their impact knocks back monsters near the one hit.
-typedef struct { const char *name; int streak; float speed; int splash, push; Uint32 trail; } Weapon;
+// The archer's weapon has seven levels. Each is earned by typing `need` keys
+// without a mistake since the weapon last changed.
+//  - Levels 1 to 3 are forgiving: they drop one level only after two wrong
+//    keys in a row.
+//  - Levels 4 and up drop one level on any wrong key.
+//  - From level 3 the impact also destroys monsters close to the one hit; from
+//    level 5 that blast is wide enough to take several most of the time.
+//  - Level 7 clears most of the field, but needs 50 WPM to earn and to keep.
+typedef struct {
+  const char *name;
+  int need;          // clean keys to earn this level from the one below
+  float speed;       // bolt speed, pixels per second
+  int blast, lanes;  // monsters within this many pixels and lanes of the hit are destroyed
+  int push;          // monsters a little further out are knocked back this far
+  Uint32 trail;
+} Weapon;
 static const Weapon weapons[] = {
-  { "OAK ARROWS",    0,  520,  0,  0, 0 },
-  { "FIRE ARROWS",  10,  560, 36, 10, C_SKIN },
-  { "SILVER BOLTS", 25,  800, 44, 14, C_WHITE },
-  { "STORM STAFF",  50, 1400, 60, 18, C_CYAN },
+  { "OAK ARROWS",     0,  520,   0, 0,  0, 0 },
+  { "FIRE ARROWS",   10,  560,   0, 1, 10, C_SKIN },
+  { "SILVER BOLTS",  15,  800,  24, 1, 12, C_WHITE },
+  { "THUNDER BOLTS", 20,  900,  34, 1, 14, C_YELLOW },
+  { "STORM STAFF",   25, 1200,  60, 2, 16, C_CYAN },
+  { "DRAGON FLAME",  30, 1400,  80, 2, 18, C_RED },
+  { "HOLY NOVA",     35, 1800, 150, 3, 20, C_PINK },
 };
+#define FORGIVING_LEVELS 3     // the first three weapons need two misses in a row to drop
+#define TOP_WEAPON_WPM 50
 #define NWEAPONS ((int)SDL_arraysize(weapons))
-static int weapon_now(void) {
-  int w = 0;
-  while (w + 1 < NWEAPONS && G.streak >= weapons[w + 1].streak) w++;
-  return w;
+static int weapon_now(void) { return G.weapon; }
+
+static void say(const char *m, Uint32 color, float secs);
+static void weapon_set(int level, bool up) {
+  char buf[40];
+  G.weapon = level; G.wstreak = 0; G.miss_run = 0; G.slow_t = 0;
+  SDL_snprintf(buf, sizeof(buf), up ? "%s!" : "DOWN TO %s", weapons[level].name);
+  say(buf, up ? C_YELLOW : C_RED, 1.4f);
+  if (up) for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(76 + k * 5), 0, 0.09f, 0.10f, k * 0.07f);
+  else sfx(WAVE_SQUARE, 330, -500, 0.25f, 0.10f, 0);
 }
 
 // Boss monsters for the W A S D battles. Each one plays a little differently.
@@ -305,16 +330,28 @@ static void spark(float x, float y, Uint32 color) {
     }
 }
 
-// Upgraded weapons stagger the monsters around the one they hit.
+// The impact of an upgraded weapon: monsters close to the one hit are destroyed
+// outright, whatever armour they have left, and those a little further out are
+// knocked back.
+static void kill_enemy(Enemy *e);
 static void splash(const Enemy *hit) {
   const Weapon *w = &weapons[weapon_now()];
-  if (!w->splash) return;
+  if (!w->blast && !w->push) return;
+  float reach = w->blast ? w->blast * 1.6f : 36;
   for (int i = 0; i < MAX_EN; i++) {
     Enemy *o = &G.en[i];
-    if (!o->alive || o->doomed || o == hit || o->rise < 1) continue;
-    if (SDL_fabsf(o->x - hit->x) > w->splash || abs(o->lane - hit->lane) > 1) continue;
-    o->x = SDL_min(o->x + w->push, 300.0f);
-    puff(o->x, enemy_y(o), w->trail, 2);
+    if (!o->alive || o->dying > 0 || o == hit || o->rise < 1) continue;
+    float dx = SDL_fabsf(o->x - hit->x);
+    if (abs(o->lane - hit->lane) > w->lanes || dx > reach) continue;
+    if (dx <= w->blast) { o->doomed = true; kill_enemy(o); }
+    else if (!o->doomed) { o->x = SDL_min(o->x + w->push, 300.0f); puff(o->x, enemy_y(o), w->trail, 2); }
+  }
+  if (w->blast) {   // a burst sized to the blast
+    for (int k = 0; k < w->blast / 3; k++) {
+      float a = rndf() * 6.2832f, r = rndf() * w->blast;
+      puff(hit->x + cosf(a) * r, enemy_y(hit) + sinf(a) * r * 0.4f, w->trail, 1);
+    }
+    if (w->blast >= 100) G.shake = 0.15f;
   }
 }
 
@@ -369,20 +406,19 @@ static void type_char(char c) {
   }
   if (!e || e->word[e->typed] != c) {
     if (c == ' ' || count_alive() == 0) return;   // a stray space, or nothing to type yet: not a mistake
-    if (weapon_now() > 0) say("STREAK BROKEN: OAK ARROWS", C_RED, 1.2f);
+    G.miss_run++;
+    if (G.weapon >= FORGIVING_LEVELS) weapon_set(G.weapon - 1, false);
+    else if (G.weapon > 0 && G.miss_run >= 2) weapon_set(G.weapon - 1, false);
+    else G.wstreak = 0;
     G.wrong++; G.streak = 0;
     sfx(WAVE_SQUARE, 110, 0, 0.09f, 0.12f, 0);
     return;
   }
   e->typed++;
-  int had = weapon_now();
-  G.correct++; G.streak++;
-  if (weapon_now() > had) {
-    char buf[40];
-    SDL_snprintf(buf, sizeof(buf), "%s!", weapons[weapon_now()].name);
-    say(buf, C_YELLOW, 1.4f);
-    for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(76 + k * 5), 0, 0.09f, 0.10f, k * 0.07f);
-  }
+  G.correct++; G.streak++; G.wstreak++; G.miss_run = 0;
+  if (G.weapon + 1 < NWEAPONS && G.wstreak >= weapons[G.weapon + 1].need &&
+      (G.weapon + 2 < NWEAPONS || G.wpm >= TOP_WEAPON_WPM))
+    weapon_set(G.weapon + 1, true);
   G.key_times[G.key_head++ & 255] = G.tclock;
   int mult = 1 + G.streak / 10; if (mult > 5) mult = 5;
   G.score += 10 * mult;
@@ -531,16 +567,16 @@ static void boss_update(float dt) {
 // ---- game flow -------------------------------------------------------------------
 static void start_rank(int r) {
   float boss_timer = G.boss_timer;
-  int score = G.score, sel = G.sel, streak = G.streak;
+  int score = G.score, sel = G.sel, streak = G.streak, weapon = G.weapon, wstreak = G.wstreak;
   SDL_memset(&G, 0, sizeof(G));
-  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak;
+  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak; G.weapon = weapon; G.wstreak = wstreak;
   G.hp = MAX_HP; G.target = -1; G.last_lane = -1; G.ward = 1;
   G.spawn_t = 1.0f; G.archer_y = (float)LANE_Y(1);
   G.boss_timer = boss_timer > 0 ? boss_timer : BOSS_MIN_GAP + rndf() * BOSS_RANDOM_GAP;
   audio_song(SONG_TYPING);
 }
 
-static void new_game(int r) { G.score = 0; G.streak = 0; G.boss_timer = 0; start_rank(r); }
+static void new_game(int r) { G.score = 0; G.streak = 0; G.weapon = 0; G.wstreak = 0; G.boss_timer = 0; start_rank(r); }
 
 // Pausing stops the audio device too, so the song clock that judges boss notes
 // freezes with the game and picks up exactly where it left off.
@@ -767,6 +803,12 @@ static void update_typing(float dt) {
     if (T.bot_t <= 0 && c) { T.bot_t = 1.0f / T.bot; type_char(c); }
   }
 
+  // The top weapon has to be kept up: a second and a half under its WPM floor loses it.
+  if (G.weapon == NWEAPONS - 1 && alive > 0) {
+    if (G.wpm < TOP_WEAPON_WPM) { G.slow_t += dt; if (G.slow_t > 1.5f) weapon_set(G.weapon - 1, false); }
+    else G.slow_t = 0;
+  }
+
   if (alive > 0) G.boss_timer -= dt;
   if (G.boss_timer <= 0 && G.kills < R->quota - 1) boss_start();
 }
@@ -921,6 +963,7 @@ static int word_at(const Enemy *e, int pos) {
 // Draws a monster's text with typed letters dimmed. A phrase is coloured word by
 // word to match its armour pips; the word being typed is the bright one.
 static void draw_words(float x, float y, const Enemy *e, int from, int to, bool targeted, int scale) {
+  x = SDL_floorf(x);   // whole pixels only, or the glyphs smear
   for (int i = from; i < to; i++) {
     int w = word_at(e, i), current = word_at(e, e->typed);
     Uint32 color = i < e->typed ? C_DGREY
@@ -1184,10 +1227,12 @@ static void draw_play(void) {
     else rect((float)(238 + i * 8), 7, 3, 2, C_DGREY);
   }
 
-  if (!boss) {   // current weapon, and how far the clean streak is from the next one
+  if (!boss) {   // current weapon, and how far the clean run is from the next one
     int w = weapon_now();
-    if (w + 1 < NWEAPONS) SDL_snprintf(buf, sizeof(buf), "%s  STREAK %d/%d", weapons[w].name, G.streak, weapons[w + 1].streak);
-    else SDL_snprintf(buf, sizeof(buf), "%s  STREAK %d", weapons[w].name, G.streak);
+    if (w + 1 >= NWEAPONS) SDL_snprintf(buf, sizeof(buf), "LV%d %s  KEEP %d WPM", w + 1, weapons[w].name, TOP_WEAPON_WPM);
+    else if (w + 2 >= NWEAPONS && G.wstreak >= weapons[w + 1].need)
+      SDL_snprintf(buf, sizeof(buf), "LV%d %s  NEXT: REACH %d WPM", w + 1, weapons[w].name, TOP_WEAPON_WPM);
+    else SDL_snprintf(buf, sizeof(buf), "LV%d %s  NEXT %d/%d", w + 1, weapons[w].name, G.wstreak, weapons[w + 1].need);
     text_shadow(4, 20, buf, w ? weapons[w].trail : C_GREY, 1);
   }
 
@@ -1418,7 +1463,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   s_bolt[0] = SPRITE(bolt, "RgYG");       // oak arrow, plain iron tip
   s_bolt[1] = SPRITE(bolt, NULL);         // fire arrow
   s_bolt[2] = SPRITE(bolt, "oGRWYW");     // silver bolt
-  s_bolt[3] = SPRITE(bolt, "oCRWYCWC");   // storm bolt
+  s_bolt[3] = SPRITE(bolt, "oYRWYWWY");   // thunder bolt
+  s_bolt[4] = SPRITE(bolt, "oCRWYCWC");   // storm bolt
+  s_bolt[5] = SPRITE(bolt, "oRRYYYWR");   // dragon flame
+  s_bolt[6] = SPRITE(bolt, "oMRWYWWM");   // holy nova
   s_tomb = SPRITE(tombstone, NULL); s_heart = SPRITE(heart, NULL); s_note = SPRITE(note_arrow, NULL);
   build_background();
 
@@ -1427,6 +1475,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   go_title();
 #ifndef __EMSCRIPTEN__
   if (getenv("HRH_RANK")) new_game(atoi(getenv("HRH_RANK")) - 1);
+  if (getenv("HRH_WEAPON")) G.weapon = SDL_clamp(atoi(getenv("HRH_WEAPON")) - 1, 0, NWEAPONS - 1);
   if (getenv("HRH_CALIB")) {   // show the calibration screen with some sample taps
     calibrate_start();
     if (atoi(getenv("HRH_CALIB")) == 2) calibrate_mode(CAL_SIGHT);
