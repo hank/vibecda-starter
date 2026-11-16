@@ -19,6 +19,9 @@ the participant guides in docs/ are left as they were in the starter.
   Handbook; check any new or changed fact against the current handbook.
   HRH_MODE=1..3 picks the mode in headless runs. Headless runs use a fixed
   random seed unless HRH_SEED=n is set; normal play seeds from the clock.
+- Monsters drop coins, spent in a shop between ranks on weapons (seven levels,
+  kept once bought), wall potions, and frost charms. High scores are kept per
+  mode. HRH_SHOP=coins opens the shop in headless runs.
 - The browser tests read the status line above the canvas, which the game
   updates from C (set_status in src/sdl/game.c). Keep the two in step.
 

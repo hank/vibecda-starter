@@ -259,6 +259,60 @@ static const char *const heart[] = {
   "...R...",
 };
 
+// The shopkeeper and the things on the counter.
+static const char *const merchant[] = {
+  "......KKKK......",
+  ".....KooooK.....",
+  "....KooooooK....",
+  "....KoOOOOoK....",
+  "....KOKOOKOK....",
+  "....KOOOOOOK....",
+  "....KWWWWWWK....",
+  "...KKWWWWWWKK...",
+  "..KooKWWWWKooK..",
+  ".KooooKWWKooooK.",
+  ".KooooooooooooK.",
+  ".KoOKooooooKOoK.",
+  ".KKKKooooooKKKK.",
+  "....KooooooK....",
+  "....KooooooK....",
+  "...KooooooooK...",
+  "...KooooooooK...",
+  "..KooooooooooK..",
+  "..KKKKKKKKKKKK..",
+};
+static const char *const potion[] = {
+  "..KKKK..",
+  "..KooK..",
+  "...KK...",
+  "..KRRK..",
+  ".KRRRRK.",
+  "KRRWRRRK",
+  "KRRRRRRK",
+  "KRRRRRRK",
+  ".KRRRRK.",
+  "..KKKK..",
+};
+static const char *const frost[] = {
+  "....C....",
+  ".C..C..C.",
+  "..C.C.C..",
+  "...CCC...",
+  "CCCCWCCCC",
+  "...CCC...",
+  "..C.C.C..",
+  ".C..C..C.",
+  "....C....",
+};
+static const char *const coin[] = {
+  ".YYYY.",
+  "YYWYYo",
+  "YWYYYo",
+  "YYYYYo",
+  "YYYYYo",
+  ".oooo.",
+};
+
 // White arrow pointing up; tinted and rotated for each dance column.
 static const char *const note_arrow[] = {
   "......KK......",

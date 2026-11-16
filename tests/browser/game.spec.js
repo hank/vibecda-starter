@@ -30,7 +30,7 @@ test('production build loads, and typing the letters slays zombies', async ({ pa
   await expect(status).toHaveText('Rank 1 SPROUT. Slain 1/12. Type J');
   await page.keyboard.press('j');
   await expect(status).toContainText('Slain 2/12');
-  // Escape pauses; Enter resumes where play left off; Q from the pause screen quits.
+  // Escape pauses; Enter resumes where play left off; Q from the pause screen ends the run.
   await page.keyboard.press('Escape');
   await expect(status).toHaveText('Paused. Press Enter to keep playing.');
   await page.keyboard.press('f');
@@ -38,6 +38,12 @@ test('production build loads, and typing the letters slays zombies', async ({ pa
   await expect(status).toContainText('Slain 2/12');
   await page.keyboard.press('Escape');
   await page.keyboard.press('q');
+  // Two zombies down is a first score, so the board asks for a name; blank is saved as ANON.
+  await expect(status).toHaveText('New high score! Type your name and press Enter.');
+  await page.waitForTimeout(600);
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText(/^High score saved: ANON \d+\. Press Enter\.$/);
+  await page.keyboard.press('Escape');
   await expect(status).toHaveText(TITLE);
   expect(errors).toEqual([]);
   expect(failures).toEqual([]);
@@ -50,6 +56,12 @@ test('a higher rank can be chosen from the title and uses whole words', async ({
   await page.locator('canvas').click();
   await page.keyboard.press('4');
   await page.keyboard.press('Enter');
+  // Starting above rank 1 opens the shop first, with coins to spend.
+  await expect(status).toHaveText('Shop. 360 coins. Weapon level 1. Enter buys, Escape heads out.');
+  await page.waitForTimeout(400);
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText('Shop. 310 coins. Weapon level 2. Enter buys, Escape heads out.');
+  await page.keyboard.press('Escape');
   await expect(status).toContainText('Rank 4 ARCHER. Slain 0/16. Type ');
   // Type whatever the game asks for until the first word is finished.
   for (let i = 0; i < 12 && !(await status.textContent()).includes('Slain 1/16'); i++) {
@@ -134,6 +146,38 @@ test('math mode asks sums and takes the answer in digits', async ({ page }) => {
   const [, a, b] = (await status.textContent()).match(/Solve (\d+)\+(\d+)$/);
   for (const digit of String(Number(a) + Number(b))) await page.keyboard.press(digit);
   await expect(status).toContainText('Solved 2/12');
+});
+
+test('a score that makes the board asks for a name and is kept', async ({ page }) => {
+  await page.goto('/');
+  const status = page.getByRole('status');
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('F3');
+  await expect(status).toHaveText('High scores, TYPING. No scores yet.');
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('ArrowRight');
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText('Math rank 1 COUNTER. Solved 0/12. Solve 1+1');
+  await page.keyboard.press('2');
+  await expect(status).toContainText('Solved 1/12');
+  // Ending the run from the pause screen still counts the score.
+  await page.keyboard.press('Escape');
+  await page.keyboard.press('q');
+  await expect(status).toHaveText('New high score! Type your name and press Enter.');
+  await page.keyboard.type('hank7');
+  await page.waitForTimeout(600);
+  await page.keyboard.press('Enter');
+  await expect(status).toHaveText(/^High score saved: HANK7 \d+\. Press Enter\.$/);
+  const score = (await status.textContent()).match(/HANK7 (\d+)/)[1];
+  // The board is per game and survives a reload.
+  await page.reload();
+  await expect(status).toHaveText(TITLE);
+  await page.locator('canvas').click();
+  await page.keyboard.press('F3');
+  await expect(status).toHaveText('High scores, TYPING. No scores yet.');
+  await page.keyboard.press('ArrowRight');
+  await expect(status).toHaveText(`High scores, MATH. 1. HANK7 ${score}.`);
 });
 
 test('the driver\'s test asks multiple-choice questions and moves on after an answer', async ({ page }) => {

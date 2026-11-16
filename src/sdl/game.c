@@ -111,7 +111,7 @@ static const char *const fingers[10] = { "PINKY", "RING", "MIDDLE", "POINTER", "
                                          "POINTER", "POINTER", "MIDDLE", "RING", "PINKY" };
 
 // ---- state -------------------------------------------------------------------
-enum { ST_TITLE, ST_PLAY, ST_RANKUP, ST_GAMEOVER, ST_VICTORY, ST_CALIBRATE };
+enum { ST_TITLE, ST_PLAY, ST_RANKUP, ST_GAMEOVER, ST_VICTORY, ST_CALIBRATE, ST_SHOP, ST_SCORES };
 enum { SUB_TYPING, SUB_BOSS, SUB_BOSS_OUT };
 enum { K_ZOMBIE, K_BAT, K_BRUTE };
 
@@ -137,8 +137,13 @@ static struct {
   Uint8 q_order[64], q_perm[4]; int q_num, q_n, q_pick, q_right; bool q_active; float q_reveal;
   bool paused;
   int hp, kills, spawned, score, streak, correct, wrong, target, last_lane;
-  int weapon, wstreak, miss_run;   // weapon level, clean keys since it changed, wrong keys in a row
-  float slow_t;                    // seconds the top weapon has spent under its WPM floor
+  int weapon;                      // weapon level, bought in the shop and kept
+  int cash, potions;               // coins from fallen monsters; wall potions in the pack
+  bool frost, frost_next;          // a frost charm slows this rank / is bought for the next one
+  int shop_sel, shop_next;         // the shop's cursor, and the rank that starts on leaving
+  bool entering, quit;             // typing a name for the high-score board; the run was ended by choice
+  bool name_kept;                  // the name shown is last time's; the first key typed replaces it
+  char name[10]; int score_pos;    // the name being typed, and where the new score landed
   float time, spawn_t, tclock, rank_clock, ward, fear_t, shake, wall_flash, state_t;
   float archer_y, shoot_t;
   float key_times[256]; int key_head;
@@ -164,46 +169,44 @@ static struct {
 
 static SDL_Window *win;
 static SDL_Texture *screen_tex, *bg_tex;
+static Spr s_merchant, s_potion, s_frost, s_coin;
 static Spr s_zombie[3][2], s_bat[2], s_brute, s_lich, s_archer, s_bolt[7], s_tomb, s_heart, s_note;
 
-// The archer's weapon has seven levels. Each is earned by typing `need` keys
-// without a mistake since the weapon last changed.
-//  - Levels 1 to 3 are forgiving: they drop one level only after two wrong
-//    keys in a row.
-//  - Levels 4 and up drop one level on any wrong key.
-//  - From level 3 the impact also destroys monsters close to the one hit; from
-//    level 5 that blast is wide enough to take several most of the time.
-//  - Level 7 clears most of the field, but needs 50 WPM to earn and to keep.
+// The archer's weapon has seven levels, bought in order from the shop between
+// ranks with the coins that monsters drop. A weapon, once bought, is kept.
+// From level 2 the impact knocks back monsters near the one hit; from level 3
+// it destroys the closest ones, and the reach grows with every level.
 typedef struct {
   const char *name;
-  int need;          // clean keys to earn this level from the one below
+  int price;         // coins to buy this level, having the one below
   float speed;       // bolt speed, pixels per second
   int blast, lanes;  // monsters within this many pixels and lanes of the hit are destroyed
   int push;          // monsters a little further out are knocked back this far
   Uint32 trail;
 } Weapon;
 static const Weapon weapons[] = {
-  { "OAK ARROWS",     0,  520,   0, 0,  0, 0 },
-  { "FIRE ARROWS",   10,  560,   0, 1, 10, C_SKIN },
-  { "SILVER BOLTS",  15,  800,  24, 1, 12, C_WHITE },
-  { "THUNDER BOLTS", 20,  900,  34, 1, 14, C_YELLOW },
-  { "STORM STAFF",   25, 1200,  60, 2, 16, C_CYAN },
-  { "DRAGON FLAME",  30, 1400,  80, 2, 18, C_RED },
-  { "HOLY NOVA",     35, 1800, 150, 3, 20, C_PINK },
+  { "OAK ARROWS",      0,  520,   0, 0,  0, 0 },
+  { "FIRE ARROWS",    50,  560,   0, 1, 10, C_SKIN },
+  { "SILVER BOLTS",  120,  800,  24, 1, 12, C_WHITE },
+  { "THUNDER BOLTS", 220,  900,  34, 1, 14, C_YELLOW },
+  { "STORM STAFF",   360, 1200,  60, 2, 16, C_CYAN },
+  { "DRAGON FLAME",  550, 1400,  80, 2, 18, C_RED },
+  { "HOLY NOVA",     800, 1800, 150, 3, 20, C_PINK },
 };
-#define FORGIVING_LEVELS 3     // the first three weapons need two misses in a row to drop
-#define TOP_WEAPON_WPM 50
+#define POTION_PRICE 120
+#define POTION_MAX 3
+#define FROST_PRICE 80
+#define START_COINS_PER_RANK 120   // pocket money when a game starts above rank 1
 #define NWEAPONS ((int)SDL_arraysize(weapons))
 static int weapon_now(void) { return G.weapon; }
 
 static void say(const char *m, Uint32 color, float secs);
-static void weapon_set(int level, bool up) {
+static void weapon_set(int level) {
   char buf[40];
-  G.weapon = level; G.wstreak = 0; G.miss_run = 0; G.slow_t = 0;
-  SDL_snprintf(buf, sizeof(buf), up ? "%s!" : "DOWN TO %s", weapons[level].name);
-  say(buf, up ? C_YELLOW : C_RED, 1.4f);
-  if (up) for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(76 + k * 5), 0, 0.09f, 0.10f, k * 0.07f);
-  else sfx(WAVE_SQUARE, 330, -500, 0.25f, 0.10f, 0);
+  G.weapon = level;
+  SDL_snprintf(buf, sizeof(buf), "%s!", weapons[level].name);
+  say(buf, C_YELLOW, 1.4f);
+  for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(76 + k * 5), 0, 0.09f, 0.10f, k * 0.07f);
 }
 
 // Boss monsters for the W A S D battles. Each one plays a little differently.
@@ -389,6 +392,7 @@ static void kill_enemy(Enemy *e) {
   if (G.mode != MODE_DRIVE) {   // in the driver's test, questions are counted, not monsters
     G.kills++;
     G.score += G.mode == MODE_MATH ? 50 + 10 * (int)strlen(e->q) : 10 * e->len;
+    G.cash += (e->kind == K_BRUTE ? 15 : e->kind == K_BAT ? 4 : 6) + 3 * (e->words - 1);   // coins for the shop
   }
   puff(e->x, enemy_y(e), e->kind == K_BAT ? C_PURPLE : e->kind == K_BRUTE ? C_SKIN : C_ZOMBIE, 10);
   sfx(WAVE_NOISE, 0, 0, 0.12f, 0.20f, 0);
@@ -513,19 +517,12 @@ static void type_char(char c) {
   }
   if (!e || e->word[e->typed] != c) {
     if (c == ' ' || count_alive() == 0) return;   // a stray space, or nothing to type yet: not a mistake
-    G.miss_run++;
-    if (G.weapon >= FORGIVING_LEVELS) weapon_set(G.weapon - 1, false);
-    else if (G.weapon > 0 && G.miss_run >= 2) weapon_set(G.weapon - 1, false);
-    else G.wstreak = 0;
     G.wrong++; G.streak = 0;
     sfx(WAVE_SQUARE, 110, 0, 0.09f, 0.12f, 0);
     return;
   }
   e->typed++;
-  G.correct++; G.streak++; G.wstreak++; G.miss_run = 0;
-  if (G.weapon + 1 < NWEAPONS && G.wstreak >= weapons[G.weapon + 1].need &&
-      (G.weapon + 2 < NWEAPONS || G.wpm >= TOP_WEAPON_WPM))
-    weapon_set(G.weapon + 1, true);
+  G.correct++; G.streak++;
   G.key_times[G.key_head++ & 255] = G.tclock;
   int mult = 1 + G.streak / 10; if (mult > 5) mult = 5;
   G.score += 10 * mult;
@@ -592,7 +589,7 @@ static void boss_end(bool won) {
   G.boss_won = won; G.sub = SUB_BOSS_OUT; G.out_t = 3.0f;
   audio_song(SONG_TYPING);
   if (won) {
-    G.score += 500;
+    G.score += 500; G.cash += 100;
     puff(G.boss_x, boss_cy(), bosses[G.boss_kind].color, 30); puff(G.boss_x, boss_cy() - 20, C_YELLOW, 20);
     for (int i = 0; i < MAX_EN; i++) if (G.en[i].alive && !G.en[i].doomed) kill_enemy(&G.en[i]);
     if (G.mode != MODE_DRIVE) G.hp = G.hp + 2 > MAX_HP ? MAX_HP : G.hp + 2;   // test misses are not healed
@@ -679,10 +676,12 @@ static void boss_update(float dt) {
 // ---- game flow -------------------------------------------------------------------
 static void start_rank(int r) {
   float boss_timer = G.boss_timer;
-  int score = G.score, sel = G.sel, streak = G.streak, weapon = G.weapon, wstreak = G.wstreak, mode = G.mode;
+  int score = G.score, sel = G.sel, streak = G.streak, weapon = G.weapon, mode = G.mode;
+  int cash = G.cash, potions = G.potions; bool frost = G.frost_next;
   SDL_memset(&G, 0, sizeof(G));
   G.mode = mode;
-  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak; G.weapon = weapon; G.wstreak = wstreak;
+  G.state = ST_PLAY; G.rank = r; G.sel = sel; G.score = score; G.streak = streak; G.weapon = weapon;
+  G.cash = cash; G.potions = potions; G.frost = frost; G.score_pos = -1;
   G.hp = G.hp_max = MAX_HP; G.target = -1; G.last_lane = -1; G.ward = 1;
   if (G.mode == MODE_DRIVE) {
     G.hp = G.hp_max = r == 0 ? 3 : 7;   // misses allowed, plus one
@@ -694,7 +693,94 @@ static void start_rank(int r) {
   audio_song(SONG_TYPING);
 }
 
-static void new_game(int r) { G.score = 0; G.streak = 0; G.weapon = 0; G.wstreak = 0; G.boss_timer = 0; start_rank(r); }
+static bool blob_write(const char *name, const void *data, int n);
+static bool blob_read(const char *name, void *data, int n);
+static void set_paused(bool paused);
+static void go_title(void);
+
+static void enter_shop(int next_rank) {
+  G.state = ST_SHOP; G.state_t = 0; G.shop_sel = 0; G.shop_next = next_rank; G.msg_t = 0;
+}
+
+static void new_game(int r) {
+  G.score = 0; G.streak = 0; G.weapon = 0; G.potions = 0; G.frost_next = false; G.boss_timer = 0;
+  G.cash = G.mode == MODE_DRIVE ? 0 : r * START_COINS_PER_RANK;
+  // Starting above rank 1 means starting with nothing bought: visit the shop first.
+  if (G.cash > 0) enter_shop(r); else start_rank(r);
+}
+
+// ---- the shop ------------------------------------------------------------------------
+enum { SHOP_WEAPON, SHOP_POTION, SHOP_FROST, SHOP_LEAVE, SHOP_SLOTS };
+
+static void shop_buy(int slot) {
+  int price = 0;
+  const char *no = NULL;
+  if (slot == SHOP_LEAVE) { start_rank(G.shop_next); return; }
+  if (slot == SHOP_WEAPON) { if (G.weapon + 1 >= NWEAPONS) no = "NOTHING FINER TO SELL"; else price = weapons[G.weapon + 1].price; }
+  else if (slot == SHOP_POTION) { if (G.potions >= POTION_MAX) no = "YOUR PACK IS FULL"; else price = POTION_PRICE; }
+  else { if (G.frost_next) no = "ALREADY YOURS"; else price = FROST_PRICE; }
+  if (!no && G.cash < price) no = "NOT ENOUGH COINS";
+  if (no) { say(no, C_RED, 1.2f); sfx(WAVE_SQUARE, 110, 0, 0.09f, 0.12f, 0); return; }
+  G.cash -= price;
+  if (slot == SHOP_WEAPON) weapon_set(G.weapon + 1);
+  else {
+    if (slot == SHOP_POTION) G.potions++; else G.frost_next = true;
+    say(slot == SHOP_POTION ? "WALL POTION!" : "FROST CHARM!", C_YELLOW, 1.2f);
+    sfx(WAVE_SQUARE, 880, 400, 0.12f, 0.1f, 0);
+  }
+}
+
+// ---- high scores -----------------------------------------------------------------------
+#define NSCORES 8
+typedef struct { char name[10]; int score, rank; } Score;
+static struct { Uint32 magic; char last_name[10]; Score board[NMODES][NSCORES]; } HS;
+#define HS_MAGIC 0x48534331u
+
+static void scores_load(void) {
+  if (T.on || !blob_read("scores.dat", &HS, (int)sizeof(HS)) || HS.magic != HS_MAGIC) SDL_memset(&HS, 0, sizeof(HS));
+  HS.magic = HS_MAGIC;
+  HS.last_name[sizeof(HS.last_name) - 1] = 0;
+  for (int m = 0; m < NMODES; m++) for (int i = 0; i < NSCORES; i++) HS.board[m][i].name[sizeof(HS.board[m][i].name) - 1] = 0;
+}
+
+// Ends the run and, if the score makes the board, asks for a name.
+static void end_run(int state) {
+  G.state = state; G.state_t = 0; G.score_pos = -1;
+  G.entering = !T.on && G.score > 0 && G.score > HS.board[G.mode][NSCORES - 1].score;
+  if (G.entering) { SDL_strlcpy(G.name, HS.last_name, sizeof(G.name)); G.name_kept = G.name[0] != 0; }
+}
+
+static void score_commit(void) {
+  Score *b = HS.board[G.mode];
+  int pos = NSCORES - 1;
+  while (pos > 0 && G.score > b[pos - 1].score) { b[pos] = b[pos - 1]; pos--; }
+  if (!G.name[0]) SDL_strlcpy(G.name, "ANON", sizeof(G.name));
+  SDL_strlcpy(b[pos].name, G.name, sizeof(b[pos].name));
+  b[pos].score = G.score; b[pos].rank = G.rank + 1;
+  SDL_strlcpy(HS.last_name, G.name, sizeof(HS.last_name));
+  blob_write("scores.dat", &HS, (int)sizeof(HS));
+  G.entering = false; G.score_pos = pos; G.state_t = 0;
+  for (int k = 0; k < 4; k++) sfx(WAVE_SQUARE, midi_hz(72 + k * 4), 0, 0.1f, 0.1f, k * 0.08f);
+}
+
+static void name_key(SDL_Keycode key) {
+  int n = (int)strlen(G.name);
+  char c = key >= SDLK_A && key <= SDLK_Z ? (char)('A' + (key - SDLK_A)) : key >= SDLK_0 && key <= SDLK_9 ? (char)('0' + (key - SDLK_0)) : 0;
+  if (G.name_kept && (c || key == SDLK_BACKSPACE)) { G.name[0] = 0; n = 0; G.name_kept = false; if (!c) return; }
+  if (c && n < 8) { G.name[n] = c; G.name[n + 1] = 0; sfx(WAVE_SQUARE, 880, 0, 0.03f, 0.07f, 0); }
+  else if (key == SDLK_BACKSPACE && n > 0) G.name[n - 1] = 0;
+  else if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) && G.state_t > 0.5f) score_commit();
+}
+
+// Q on the pause screen: a run that made the board still gets its name taken.
+static void quit_run(void) {
+  set_paused(false);
+  if (T.on || G.score <= 0 || G.score <= HS.board[G.mode][NSCORES - 1].score) { go_title(); return; }
+  audio_song(SONG_NONE);
+  G.quit = true;
+  end_run(ST_GAMEOVER);
+}
+
 
 // Pausing stops the audio device too, so the song clock that judges boss notes
 // freezes with the game and picks up exactly where it left off.
@@ -806,6 +892,42 @@ static void calibrate_tap(void) {
   Cal.err[Cal.n++ % CAL_TAPS] = (float)e;
 }
 
+// ---- small files -----------------------------------------------------------------------
+// Fixed-size blobs: a file in the preferences folder natively, localStorage on the web.
+static bool blob_write(const char *name, const void *data, int n) {
+#ifdef __EMSCRIPTEN__
+  return EM_ASM_INT({ try {
+    var b = HEAPU8.subarray($0, $0 + $1);
+    var s = '';
+    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    localStorage.setItem('hrh-' + UTF8ToString($2), btoa(s)); return 1;
+  } catch (e) { return 0; } }, data, n, name);
+#else
+  if (T.on) return false;
+  char path[512]; pref_file(name, path, sizeof(path));
+  FILE *f = fopen(path, "wb");
+  bool ok = false;
+  if (f) { ok = fwrite(data, (size_t)n, 1, f) == 1; fclose(f); }
+  return ok;
+#endif
+}
+static bool blob_read(const char *name, void *data, int n) {
+#ifdef __EMSCRIPTEN__
+  return EM_ASM_INT({ try {
+    var s = localStorage.getItem('hrh-' + UTF8ToString($2)); if (!s) return 0;
+    s = atob(s); if (s.length != $1) return 0;
+    for (var i = 0; i < s.length; i++) HEAPU8[$0 + i] = s.charCodeAt(i);
+    return 1;
+  } catch (e) { return 0; } }, data, n, name);
+#else
+  char path[512]; pref_file(name, path, sizeof(path));
+  FILE *f = fopen(path, "rb");
+  bool ok = false;
+  if (f) { ok = fread(data, (size_t)n, 1, f) == 1; fclose(f); }
+  return ok;
+#endif
+}
+
 // ---- save and load -------------------------------------------------------------------
 // F6 stores the whole game in progress; F7 brings it back, paused.
 typedef struct { Uint32 magic, size; int last_boss; } SaveHead;
@@ -816,38 +938,14 @@ static void save_game(void) {
   if (G.state != ST_PLAY) { say("NOTHING TO SAVE YET", C_GREY, 1.5f); return; }
   save_buf.head = (SaveHead){ SAVE_MAGIC, (Uint32)sizeof(G), last_boss };
   SDL_memcpy(save_buf.game, &G, sizeof(G));
-  bool ok = false;
-#ifdef __EMSCRIPTEN__
-  ok = EM_ASM_INT({ try {
-    var b = HEAPU8.subarray($0, $0 + $1);
-    var s = '';
-    for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-    localStorage.setItem('hrh-save', btoa(s)); return 1;
-  } catch (e) { return 0; } }, &save_buf, (int)sizeof(save_buf));
-#else
-  char path[512]; pref_file("save.dat", path, sizeof(path));
-  FILE *f = fopen(path, "wb");
-  if (f) { ok = fwrite(&save_buf, sizeof(save_buf), 1, f) == 1; fclose(f); }
-#endif
+  bool ok = blob_write("save.dat", &save_buf, (int)sizeof(save_buf));
   say(ok ? "GAME SAVED" : "COULD NOT SAVE", ok ? C_ZOMBIE : C_RED, 1.5f);
   if (ok) sfx(WAVE_SQUARE, 880, 400, 0.12f, 0.1f, 0);
 }
 
 static void set_paused(bool paused);
 static void load_game(void) {
-  bool ok = false;
-#ifdef __EMSCRIPTEN__
-  ok = EM_ASM_INT({ try {
-    var s = localStorage.getItem('hrh-save'); if (!s) return 0;
-    s = atob(s); if (s.length != $1) return 0;
-    for (var i = 0; i < s.length; i++) HEAPU8[$0 + i] = s.charCodeAt(i);
-    return 1;
-  } catch (e) { return 0; } }, &save_buf, (int)sizeof(save_buf));
-#else
-  char path[512]; pref_file("save.dat", path, sizeof(path));
-  FILE *f = fopen(path, "rb");
-  if (f) { ok = fread(&save_buf, sizeof(save_buf), 1, f) == 1; fclose(f); }
-#endif
+  bool ok = blob_read("save.dat", &save_buf, (int)sizeof(save_buf));
   // A save from a different version of the game has a different size and is refused.
   if (!ok || save_buf.head.magic != SAVE_MAGIC || save_buf.head.size != sizeof(G)) { say("NO SAVED GAME FOUND", C_RED, 1.5f); return; }
   SDL_memcpy(&G, save_buf.game, sizeof(G));
@@ -972,7 +1070,7 @@ static void update_typing(float dt) {
     if (!e->alive || e->dying > 0) continue;
     e->anim += dt;
     if (e->rise < 1) { e->rise += dt * 1.2f; continue; }
-    float v = R->speed * (e->kind == K_BAT ? 1.8f : e->kind == K_BRUTE ? 0.6f : 1.0f);
+    float v = R->speed * (e->kind == K_BAT ? 1.8f : e->kind == K_BRUTE ? 0.6f : 1.0f) * (G.frost ? 0.8f : 1.0f);
     if (e->x > WALL_STOP) e->x -= v * dt;
     else if (!e->doomed) {
       e->atk -= dt;
@@ -984,12 +1082,6 @@ static void update_typing(float dt) {
     T.bot_t -= dt;
     char c = next_char();
     if (T.bot_t <= 0 && c) { T.bot_t = 1.0f / T.bot; type_char(c); }
-  }
-
-  // The top weapon has to be kept up: a second and a half under its WPM floor loses it.
-  if (G.weapon == NWEAPONS - 1 && alive > 0) {
-    if (G.wpm < TOP_WEAPON_WPM) { G.slow_t += dt; if (G.slow_t > 1.5f) weapon_set(G.weapon - 1, false); }
-    else G.slow_t = 0;
   }
 
   if (alive > 0) G.boss_timer -= dt;
@@ -1012,7 +1104,11 @@ static void update(float dt) {
     p->life -= dt; p->x += p->vx * dt; p->y += p->vy * dt; p->vy += 160 * dt;
   }
   if (G.state != ST_PLAY) {
-    if (T.bot > 0 && G.state == ST_RANKUP && G.state_t > 1) start_rank(G.rank + 1);
+    if (T.bot > 0 && G.state == ST_RANKUP && G.state_t > 1) enter_shop(G.rank + 1);
+    else if (T.bot > 0 && G.state == ST_SHOP) {   // the test bot buys every weapon it can afford
+      while (G.weapon + 1 < NWEAPONS && G.cash >= weapons[G.weapon + 1].price) shop_buy(SHOP_WEAPON);
+      shop_buy(SHOP_LEAVE);
+    }
     return;
   }
 
@@ -1044,12 +1140,17 @@ static void update(float dt) {
     if (e->hurt > 0) e->hurt -= dt;
   }
 
-  if (G.hp <= 0) {
-    G.hp = 0; G.state = ST_GAMEOVER; G.state_t = 0;
+  if (G.hp <= 0 && G.potions > 0 && G.mode != MODE_DRIVE) {   // a wall potion saves the night
+    G.potions--; G.hp = 5;
+    for (int i = 0; i < MAX_EN; i++) if (G.en[i].alive && !G.en[i].doomed) { G.en[i].x = SDL_min(G.en[i].x + 70, 300.0f); G.en[i].atk = 1.5f; }
+    say("POTION! THE WALL STANDS", C_ZOMBIE, 2.0f);
+    for (int k = 0; k < 3; k++) sfx(WAVE_SQUARE, midi_hz(64 + k * 7), 0, 0.12f, 0.12f, k * 0.09f);
+  } else if (G.hp <= 0) {
+    G.hp = 0; end_run(ST_GAMEOVER);
     audio_song(SONG_NONE);
     for (int i = 0; i < 4; i++) sfx(WAVE_SQUARE, midi_hz(57 - i * 3), 0, 0.3f, 0.14f, i * 0.28f);
   } else if (G.kills >= ranks[G.rank].quota && G.sub == SUB_TYPING && G.q_reveal <= 0) {
-    G.state = G.rank + 1 >= NRANKS || G.mode == MODE_DRIVE ? ST_VICTORY : ST_RANKUP; G.state_t = 0;
+    if (G.rank + 1 >= NRANKS || G.mode == MODE_DRIVE) end_run(ST_VICTORY); else { G.state = ST_RANKUP; G.state_t = 0; }
     for (int i = 0; i < 5; i++) sfx(WAVE_SQUARE, midi_hz(69 + (int[]){ 0, 4, 7, 12, 16 }[i]), 0, 0.14f, 0.12f, i * 0.11f);
   }
 }
@@ -1473,13 +1574,15 @@ static void draw_play(void) {
   }
 
   if (G.mode == MODE_DRIVE && !boss) draw_quiz();
-  if (!boss && G.mode != MODE_DRIVE) {   // current weapon, and how far the clean run is from the next one
+  if (!boss && G.mode != MODE_DRIVE) {   // current weapon, coins, and anything carried
     int w = weapon_now();
-    if (w + 1 >= NWEAPONS) SDL_snprintf(buf, sizeof(buf), "LV%d %s  KEEP %d WPM", w + 1, weapons[w].name, TOP_WEAPON_WPM);
-    else if (w + 2 >= NWEAPONS && G.wstreak >= weapons[w + 1].need)
-      SDL_snprintf(buf, sizeof(buf), "LV%d %s  NEXT: REACH %d WPM", w + 1, weapons[w].name, TOP_WEAPON_WPM);
-    else SDL_snprintf(buf, sizeof(buf), "LV%d %s  NEXT %d/%d", w + 1, weapons[w].name, G.wstreak, weapons[w + 1].need);
+    SDL_snprintf(buf, sizeof(buf), "LV%d %s", w + 1, weapons[w].name);
     text_shadow(4, 20, buf, w ? weapons[w].trail : C_GREY, 1);
+    SDL_snprintf(buf, sizeof(buf), "%d", G.cash);
+    spr(s_coin, (float)(310 - text_w(buf, 1) - 9), 20);
+    text_shadow((float)(310 - text_w(buf, 1)), 20, buf, C_YELLOW, 1);
+    for (int k = 0; k < G.potions; k++) spr(s_potion, (float)(250 - text_w(buf, 1) - k * 10), 18);
+    if (G.frost) spr(s_frost, 150, 19);
   }
 
   // bottom panel
@@ -1545,40 +1648,162 @@ static void draw_title(void) {
   else text_center(160, 200, "LEFT / RIGHT: GAME   UP / DOWN: LEVEL   F7: LOAD", C_GREY, 1);
   if ((int)(G.time * 2) & 1) text_center(160, 214, "PRESS ENTER TO START", C_WHITE, 1);
 #ifndef __EMSCRIPTEN__
-  text_center(160, 228, "F2: CALIBRATE THE BEAT   F11: FULLSCREEN", C_DGREY, 1);
+  text_center(160, 228, "F2: CALIBRATE   F3: HIGH SCORES   F11: FULLSCREEN", C_DGREY, 1);
 #else
-  text_center(160, 228, "F2: CALIBRATE THE BEAT", C_DGREY, 1);
+  text_center(160, 228, "F2: CALIBRATE THE BEAT   F3: HIGH SCORES", C_DGREY, 1);
 #endif
+}
+
+static void draw_scores(float y, int mode, int highlight) {
+  char buf[48];
+  for (int i = 0; i < NSCORES; i++) {
+    const Score *sc = &HS.board[mode][i];
+    bool on = i == highlight;
+    if (sc->score > 0) SDL_snprintf(buf, sizeof(buf), "%d. %-8s %7d  R%d", i + 1, sc->name, sc->score, sc->rank);
+    else SDL_snprintf(buf, sizeof(buf), "%d. --------", i + 1);
+    if (on) rect_a(78, y + (float)(i * 10) - 2, 164, 10, C_DPURP, 255);
+    text(84, y + (float)(i * 10), buf, on ? C_YELLOW : sc->score > 0 ? C_WHITE : C_DGREY, 1);
+  }
 }
 
 static void draw_banner(void) {
   char buf[64];
   int total = G.correct + G.wrong, acc = total ? G.correct * 100 / total : 100;
   float avg = G.rank_clock > 1 ? (float)G.correct / 5.0f / (G.rank_clock / 60.0f) : 0;
-  overlay(170);
-  if (G.state == ST_GAMEOVER) {
-    text_center(160, 60, G.mode == MODE_DRIVE ? "TEST FAILED" : "THE WALL HAS", C_RED, 3);
-    text_center(160, 86, G.mode == MODE_DRIVE ? "TOO MANY MISSES" : "FALLEN", C_RED, G.mode == MODE_DRIVE ? 2 : 3);
-    text_center(160, 150, "ENTER: TRY THIS RANK AGAIN", C_WHITE, 1);
-    text_center(160, 164, "ESC: BACK TO THE TITLE", C_GREY, 1);
-  } else if (G.state == ST_VICTORY) {
-    text_center(160, 50, G.mode == MODE_DRIVE ? "YOU PASSED!" : "DAWN BREAKS!", C_YELLOW, 3);
-    if (G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "%d OF %d CORRECT", G.q_right, G.kills);
-    else SDL_snprintf(buf, sizeof(buf), "THE COMPOUND IS SAFE");
-    text_center(160, 82, buf, C_WHITE, 2);
-    text_center(160, 164, "ENTER: BACK TO THE TITLE", C_WHITE, 1);
-  } else {
+  bool drive = G.mode == MODE_DRIVE;
+  overlay(G.state == ST_RANKUP ? 170 : 205);
+  if (G.state != ST_RANKUP) rect(0, 198, SCREEN_W, 42, C_BLACK);
+  if (G.state == ST_RANKUP) {
     text_center(160, 50, "RANK UP!", C_YELLOW, 4);
     SDL_snprintf(buf, sizeof(buf), "NEXT RANK: %s", ranks[G.rank + 1].name);
     text_center(160, 90, buf, C_WHITE, 1);
     text_center(160, 102, ranks[G.rank + 1].blurb, C_CYAN, 1);
-    text_center(160, 164, "ENTER: NEXT NIGHT", C_WHITE, 1);
+    if (G.mode == MODE_TYPE) SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
+    else SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%", acc);
+    text_center(160, 124, buf, C_GREY, 1);
+    SDL_snprintf(buf, sizeof(buf), "SCORE %d   COINS %d", G.score, G.cash);
+    text_center(160, 136, buf, C_CYAN, 1);
+    text_center(160, 164, "ENTER: VISIT THE SHOP", C_WHITE, 1);
+    return;
   }
-  if (G.mode == MODE_TYPE) SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%   SPEED %d WPM", acc, (int)(avg + 0.5f));
-  else SDL_snprintf(buf, sizeof(buf), "ACCURACY %d%%", acc);
-  text_center(160, 124, buf, C_GREY, 1);
-  SDL_snprintf(buf, sizeof(buf), "SCORE %d", G.score);
-  text_center(160, 136, buf, C_CYAN, 1);
+  if (G.state == ST_VICTORY) {
+    text_center(160, 20, drive ? "YOU PASSED!" : "DAWN BREAKS!", C_YELLOW, 3);
+    if (drive) SDL_snprintf(buf, sizeof(buf), "%d OF %d CORRECT", G.q_right, G.kills);
+    else SDL_snprintf(buf, sizeof(buf), "THE COMPOUND IS SAFE");
+    text_center(160, 48, buf, C_WHITE, 2);
+  } else if (G.quit) text_center(160, 30, "RUN OVER", C_SKIN, 3);
+  else {
+    text_center(160, 20, drive ? "TEST FAILED" : "THE WALL HAS", C_RED, 3);
+    text_center(160, 46, drive ? "TOO MANY MISSES" : "FALLEN", C_RED, drive ? 2 : 3);
+  }
+  SDL_snprintf(buf, sizeof(buf), "SCORE %d   ACCURACY %d%%", G.score, acc);
+  text_center(160, 76, buf, C_CYAN, 1);
+  if (G.entering) {
+    text_center(160, 100, "NEW HIGH SCORE!", C_YELLOW, 2);
+    text_center(160, 126, "TYPE YOUR NAME, THEN PRESS ENTER", C_WHITE, 1);
+    SDL_snprintf(buf, sizeof(buf), "%s%s", G.name, ((int)(G.time * 3) & 1) && strlen(G.name) < 8 ? "-" : " ");
+    text_center(160, 146, buf, C_ZOMBIE, 3);
+    return;
+  }
+  SDL_snprintf(buf, sizeof(buf), "HIGH SCORES: %s", mode_names[G.mode]);
+  text_center(160, 94, buf, C_YELLOW, 1);
+  draw_scores(108, G.mode, G.score_pos);
+  if (G.state == ST_VICTORY) text_center(160, 214, "ENTER: BACK TO THE TITLE", C_WHITE, 1);
+  else {
+    text_center(160, 204, drive ? "ENTER: TAKE THE TEST AGAIN" : "ENTER: TRY THIS RANK AGAIN", C_WHITE, 1);
+    text_center(160, 216, "ESC: BACK TO THE TITLE", C_GREY, 1);
+  }
+}
+
+// The high-score board on its own, from the title screen.
+static void draw_scores_screen(void) {
+  char buf[48];
+  SDL_RenderTexture(ren, bg_tex, NULL, NULL);
+  overlay(200);
+  text_center(160, 20, "HIGH SCORES", C_YELLOW, 3);
+  SDL_snprintf(buf, sizeof(buf), "< %s >", mode_names[G.mode]);
+  text_center(160, 56, buf, C_WHITE, 2);
+  draw_scores(90, G.mode, -1);
+  text_center(160, 200, "LEFT / RIGHT: OTHER GAMES", C_GREY, 1);
+  text_center(160, 214, "ESC: BACK TO THE TITLE", C_GREY, 1);
+}
+
+// The shop: a merchant between two fires, with wares on the counter.
+static void draw_shop(void) {
+  char buf[64];
+  const char *line1 = "", *line2 = "";
+  char l2[48] = "";
+  rect(0, 0, SCREEN_W, SCREEN_H, C_BLACK);
+  for (int y = 0; y < SCREEN_H; y += 8)       // brick walls on three sides
+    for (int x = -8 + (y / 8 % 2) * 8; x < SCREEN_W; x += 16) {
+      if (y >= 16 && x >= 16 && x < SCREEN_W - 24) continue;
+      rect((float)x, (float)y, 15, 7, y < 16 ? 0x7C2800 : 0x582000);
+    }
+  rect(128, 232, 64, 8, C_BLACK);             // the way out
+  text_center(160, 24, "GOOD COIN BUYS GOOD STEEL, TRAVELER.", C_WHITE, 1);
+  SDL_FRect m = { 144, 40, 32, 38 };
+  SDL_RenderTexture(ren, s_merchant.t, NULL, &m);
+  for (int k = 0; k < 2; k++) {               // the two fires
+    float fx = k ? 216.0f : 92.0f;
+    bool f = ((int)(G.time * 8) + k) % 2;
+    rect(fx, 70, 12, 4, C_DGREY); rect(fx + 2, 74, 8, 3, C_DGREY);
+    rect(fx + 1, f ? 56.0f : 59.0f, 10, f ? 14.0f : 11.0f, C_RED);
+    rect(fx + 3, f ? 60.0f : 62.0f, 6, f ? 10.0f : 8.0f, C_YELLOW);
+  }
+  for (int slot = 0; slot < SHOP_SLOTS; slot++) {
+    float cx = 56.0f + 68.0f * (float)slot;
+    bool on = slot == G.shop_sel;
+    const char *n1 = "", *n2 = "";
+    int price = -1;
+    char w1[16] = "", w2[16] = "";
+    if (slot == SHOP_WEAPON) {
+      int next = G.weapon + 1 < NWEAPONS ? G.weapon + 1 : G.weapon;
+      SDL_sscanf(weapons[next].name, "%15s %15s", w1, w2);
+      n1 = w1; n2 = w2;
+      SDL_FRect d = { cx - 15, 108, 30, 9 };
+      SDL_RenderTexture(ren, s_bolt[next].t, NULL, &d);
+      if (G.weapon + 1 < NWEAPONS) price = weapons[next].price;
+      if (on) {
+        if (price < 0) line1 = "YOU HOLD THE FINEST WEAPON THERE IS.";
+        else if (weapons[next].blast) { line1 = "ITS BLAST DESTROYS MONSTERS NEAR THE ONE YOU HIT."; SDL_snprintf(l2, sizeof(l2), "LEVEL %d. BLAST REACH %d.", next + 1, weapons[next].blast); }
+        else { line1 = "KNOCKS BACK MONSTERS NEAR THE ONE YOU HIT."; SDL_snprintf(l2, sizeof(l2), "LEVEL %d.", next + 1); }
+      }
+    } else if (slot == SHOP_POTION) {
+      n1 = "WALL"; n2 = "POTION";
+      SDL_FRect d = { cx - 8, 102, 16, 20 };
+      SDL_RenderTexture(ren, s_potion.t, NULL, &d);
+      if (G.potions < POTION_MAX) price = POTION_PRICE;
+      if (on) { line1 = "IF THE WALL FALLS, IT IS REBUILT TO 5 HEARTS."; SDL_snprintf(l2, sizeof(l2), "YOU CARRY %d OF %d.", G.potions, POTION_MAX); }
+    } else if (slot == SHOP_FROST) {
+      n1 = "FROST"; n2 = "CHARM";
+      SDL_FRect d = { cx - 9, 103, 18, 18 };
+      SDL_RenderTexture(ren, s_frost.t, NULL, &d);
+      if (!G.frost_next) price = FROST_PRICE;
+      if (on) line1 = "MONSTERS WALK SLOWER FOR THE WHOLE NEXT RANK.";
+    } else {
+      n1 = "HEAD"; n2 = "OUT";
+      rect(cx - 8, 100, 16, 22, C_BROWN); rect(cx - 6, 103, 12, 19, C_BLACK); rect(cx + 2, 111, 2, 2, C_YELLOW);
+      if (on) { line1 = "BACK TO THE WALL."; SDL_snprintf(l2, sizeof(l2), "RANK %d AWAITS.", G.shop_next + 1); }
+    }
+    if (on) frame(cx - 31, 96, 62, 66, ((int)(G.time * 4) & 1) ? C_YELLOW : C_SKIN);
+    text_center(cx, 128, n1, on ? C_WHITE : C_GREY, 1);
+    text_center(cx, 137, n2, on ? C_WHITE : C_GREY, 1);
+    if (slot != SHOP_LEAVE) {
+      if (price < 0) text_center(cx, 150, "SOLD", C_DGREY, 1);
+      else {
+        SDL_snprintf(buf, sizeof(buf), "%d", price);
+        spr(s_coin, cx - text_w(buf, 1) / 2.0f - 5, 150);
+        text(SDL_floorf(cx - text_w(buf, 1) / 2.0f) + 4, 150, buf, G.cash >= price ? C_YELLOW : C_RED, 1);
+      }
+    }
+  }
+  if (l2[0]) line2 = l2;
+  if (G.msg_t > 0) text_center(160, 172, G.msg, G.msg_color, 2);
+  else { text_center(160, 170, line1, C_CYAN, 1); text_center(160, 181, line2, C_GREY, 1); }
+  SDL_snprintf(buf, sizeof(buf), "YOUR COINS: %d", G.cash);
+  text_center(160, 198, buf, C_YELLOW, 1);
+  text_center(160, 211, "LEFT / RIGHT: CHOOSE   ENTER: BUY", C_GREY, 1);
+  text_center(160, 222, "ESC: HEAD OUT", C_GREY, 1);
 }
 
 static void update_status(void) {
@@ -1586,6 +1811,11 @@ static void update_status(void) {
   const Rank *R = &ranks[G.rank];
   if (G.state == ST_TITLE) SDL_snprintf(buf, sizeof(buf), "Home Row Horde. Press Enter to start.");
   else if (G.state == ST_CALIBRATE) SDL_snprintf(buf, sizeof(buf), "Beat calibration, %s step. Tap space on every beat. Sound %d ms, sight %d ms.", Cal.mode == CAL_SIGHT ? "sight" : "sound", A.offset_ms, A.visual_ms);
+  else if (G.state == ST_SHOP) SDL_snprintf(buf, sizeof(buf), "Shop. %d coins. Weapon level %d. Enter buys, Escape heads out.", G.cash, G.weapon + 1);
+  else if (G.state == ST_SCORES && HS.board[G.mode][0].score > 0) SDL_snprintf(buf, sizeof(buf), "High scores, %s. 1. %s %d.", mode_names[G.mode], HS.board[G.mode][0].name, HS.board[G.mode][0].score);
+  else if (G.state == ST_SCORES) SDL_snprintf(buf, sizeof(buf), "High scores, %s. No scores yet.", mode_names[G.mode]);
+  else if ((G.state == ST_GAMEOVER || G.state == ST_VICTORY) && G.entering) SDL_snprintf(buf, sizeof(buf), "New high score! Type your name and press Enter.");
+  else if ((G.state == ST_GAMEOVER || G.state == ST_VICTORY) && G.score_pos >= 0) SDL_snprintf(buf, sizeof(buf), "High score saved: %s %d. Press Enter.", G.name, G.score);
   else if (G.state == ST_PLAY && G.paused) SDL_snprintf(buf, sizeof(buf), "Paused. Press Enter to keep playing.");
   else if (G.state == ST_GAMEOVER) SDL_snprintf(buf, sizeof(buf), G.mode == MODE_DRIVE ? "Test failed: too many misses. Press Enter to try again." : "The wall has fallen. Press Enter to try again.");
   else if (G.state == ST_VICTORY && G.mode == MODE_DRIVE) SDL_snprintf(buf, sizeof(buf), "You passed! %d of %d correct.", G.q_right, G.kills);
@@ -1612,6 +1842,8 @@ static void draw(void) {
   SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
   if (G.state == ST_TITLE) draw_title();
   else if (G.state == ST_CALIBRATE) draw_calibrate();
+  else if (G.state == ST_SHOP) draw_shop();
+  else if (G.state == ST_SCORES) draw_scores_screen();
   else {
     draw_play();
     if (G.state != ST_PLAY) draw_banner();
@@ -1653,6 +1885,7 @@ static void key_down(SDL_Keycode key) {
   bool enter = key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE;
   if (key == SDLK_F6) { save_game(); return; }
   if (key == SDLK_F7) { load_game(); return; }
+  if ((G.state == ST_GAMEOVER || G.state == ST_VICTORY) && G.entering) { name_key(key); return; }
   switch (G.state) {
     case ST_CALIBRATE: {
       bool sight = Cal.mode == CAL_SIGHT;
@@ -1673,8 +1906,20 @@ static void key_down(SDL_Keycode key) {
       else if (key == SDLK_SPACE || key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_UP || key == SDLK_DOWN) calibrate_tap();
       break;
     }
+    case ST_SHOP:
+      if (key == SDLK_LEFT) { G.shop_sel = (G.shop_sel + SHOP_SLOTS - 1) % SHOP_SLOTS; sfx(WAVE_SQUARE, 660, 0, 0.04f, 0.08f, 0); }
+      else if (key == SDLK_RIGHT) { G.shop_sel = (G.shop_sel + 1) % SHOP_SLOTS; sfx(WAVE_SQUARE, 660, 0, 0.04f, 0.08f, 0); }
+      else if (key >= SDLK_1 && key < SDLK_1 + SHOP_SLOTS) G.shop_sel = (int)(key - SDLK_1);
+      else if (enter && G.state_t > 0.3f) shop_buy(G.shop_sel);
+      else if (key == SDLK_ESCAPE) shop_buy(SHOP_LEAVE);
+      break;
+    case ST_SCORES:
+      if (key == SDLK_LEFT || key == SDLK_RIGHT) G.mode = (G.mode + (key == SDLK_RIGHT ? 1 : NMODES - 1)) % NMODES;
+      else if (key == SDLK_ESCAPE || enter || key == SDLK_F3) { G.sel = 0; go_title(); }
+      break;
     case ST_TITLE:
       if (key == SDLK_F2) { calibrate_start(); break; }
+      if (key == SDLK_F3) { G.state = ST_SCORES; break; }
       if (key == SDLK_LEFT || key == SDLK_RIGHT) {   // switch between typing, math, and the driver's test
         G.mode = (G.mode + (key == SDLK_RIGHT ? 1 : NMODES - 1)) % NMODES; G.sel = 0;
         sfx(WAVE_SQUARE, 880, 0, 0.04f, 0.08f, 0);
@@ -1688,7 +1933,7 @@ static void key_down(SDL_Keycode key) {
     case ST_PLAY:
       if (G.paused) {
         if (enter || key == SDLK_ESCAPE) set_paused(false);
-        else if (key == SDLK_Q) go_title();
+        else if (key == SDLK_Q) quit_run();
         else if (key == SDLK_LEFT) offset_change(-10);
         else if (key == SDLK_RIGHT) offset_change(10);
         break;
@@ -1717,7 +1962,7 @@ static void key_down(SDL_Keycode key) {
       }
       break;
     case ST_RANKUP:
-      if (enter && G.state_t > 0.5f) start_rank(G.rank + 1);
+      if (enter && G.state_t > 0.5f) enter_shop(G.rank + 1);
       else if (key == SDLK_ESCAPE) go_title();
       break;
     case ST_GAMEOVER:
@@ -1756,6 +2001,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
   s_bat[0] = SPRITE(bat_a, NULL); s_bat[1] = SPRITE(bat_b, NULL);
   s_brute = SPRITE(brute, NULL); s_archer = SPRITE(archer, NULL);
   s_lich = SPRITE(lich, NULL);
+  s_merchant = SPRITE(merchant, NULL); s_potion = SPRITE(potion, NULL); s_frost = SPRITE(frost, NULL); s_coin = SPRITE(coin, NULL);
   s_bolt[0] = SPRITE(bolt, "RgYG");       // oak arrow, plain iron tip
   s_bolt[1] = SPRITE(bolt, NULL);         // fire arrow
   s_bolt[2] = SPRITE(bolt, "oGRWYW");     // silver bolt
@@ -1779,10 +2025,12 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #endif
   audio_init(T.on);
   settings_load();
+  scores_load();
   go_title();
 #ifndef __EMSCRIPTEN__
   if (getenv("HRH_MODE")) G.mode = SDL_clamp(atoi(getenv("HRH_MODE")) - 1, 0, NMODES - 1);
   if (getenv("HRH_RANK")) new_game(SDL_clamp(atoi(getenv("HRH_RANK")) - 1, 0, NRANKS - 1));
+  if (getenv("HRH_SHOP")) { G.cash = atoi(getenv("HRH_SHOP")); G.weapon = 2; G.potions = 1; enter_shop(3); }
   if (getenv("HRH_WEAPON")) G.weapon = SDL_clamp(atoi(getenv("HRH_WEAPON")) - 1, 0, NWEAPONS - 1);
   if (getenv("HRH_CALIB")) {   // show the calibration screen with some sample taps
     calibrate_start();
